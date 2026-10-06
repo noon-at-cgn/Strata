@@ -616,6 +616,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         dhead_ = shared->dhead_;
         dvocab_ = shared->dvocab_;
         n_dvocab_ = shared->n_dvocab_;
+        dhead_type_ = shared->dhead_type_;   // the subset's ggml type (-1 here = "unsupported native MMVQ GGML type")
+        dvocab_host_ = shared->dvocab_host_; // top2_ maps a draft-head row to its token through this host copy
         owns_draft_head_ = false;
     }
     // the draft head's token subset, when tools/draft_vocab.py wrote one
