@@ -31,7 +31,8 @@
     "--trim-stage-weights",
     "--vram-reserve-mib",
     "1100",
-    "--vision"
+    "--vision",
+    "--batch-mtp"
   ],
   "parallel": 2,
   "vision": {

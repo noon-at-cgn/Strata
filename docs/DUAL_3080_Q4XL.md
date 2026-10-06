@@ -32,7 +32,7 @@ the arena mode (every expert in RAM, 71.7 + 26.8 GiB) cannot fit and the residen
 --pack <pack> --native <shard 1 of the 4> --expert-profile data/expert-profile.bin --expert-cache auto
 --prefill auto --spec 4 --spec-min-p 0.5 --mtp <mtp/rt>
 --max-context 262144 --kv int8 --kv-resident 32768 --kv-pool-tokens 524288
---resident-experts --ple-io ram --trim-stage-weights --vram-reserve-mib 1100
+--resident-experts --ple-io ram --trim-stage-weights --vram-reserve-mib 1100 --batch-mtp
 "parallel": 2, "layer_split": "24", "gpu": [0, 1]
 ```
 
@@ -100,6 +100,30 @@ Same config, one lane, `--max-context 262144`, only `--kv-resident` differs:
 Streaming costs nothing measurable here (the streamed layers hit VRAM ~96%, misses are 2-4 KB contiguous runs
 fetched by a UVA kernel), buys ~1,000 cached experts, and uses *less* total RAM because the VRAM it frees shrinks the
 RAM complement. Keep KV in RAM.
+
+## Batch MTP on the split (`--batch-mtp`)
+
+Upstream refused `--batch-mtp` (each batch slot verifies one MTP proposal per window) with a layer split, so two
+concurrent users decoded one token per window each. This branch lifts that for a 2-stage split: the slot drafters live
+on the last stage's GPU (where the draft layer is), the verifier's slot commit already chained across stages, and the
+hidden rows reach the drafter from the last stage. `--batch-groups > 1` and a same-GPU split stay refused.
+
+Two real bugs were in the way: slot drafters were bound against stage 0's session, and a *shared* drafter's `bind()`
+never inherited the draft head's ggml type (`-1`: every slot draft died with "unsupported native MMVQ GGML type" and
+took the engine down) nor its host vocab map (`top2_` would index an empty vector).
+
+| 2 concurrent streams | per stream | aggregate |
+|---|---|---|
+| Coder IQ1_M test model (all experts in VRAM), static residency, no `--batch-mtp` | 42.7 / 46.3 tok/s | 84.0 |
+| same, `--batch-mtp` | 52.3 / 57.0 | **101.2** (+20%) |
+| UD-Q4_K_XL production, no `--batch-mtp` (2 runs) | 22.9-25.9 | 39.9-43.5 |
+| UD-Q4_K_XL production, `--batch-mtp` (2 runs) | 24.1-29.9 | **44.5-51.3** (about +15%) |
+
+On the test model, greedy output with and without `--batch-mtp` was **identical** for both streams and the solo stream
+(static residency, `--adapt-every 100000 --pcie-frac 0`), as speculative verification should give. Production: 72.6% of
+proposals accepted, 3.42 rows per window. A single stream, long-context decode and prefill are unchanged (they never
+used the batch path). The gain is limited because a window is CPU-expert and GPU-reach bound (about 15 ms of CPU
+experts and 14 ms of waiting on the first card per 56 ms window).
 
 ## Images (CPU encoder)
 
