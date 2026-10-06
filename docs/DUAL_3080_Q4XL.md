@@ -81,11 +81,24 @@ Streaming costs nothing measurable here (the streamed layers hit VRAM ~96%, miss
 fetched by a UVA kernel), buys ~1,000 cached experts, and uses *less* total RAM because the VRAM it frees shrinks the
 RAM complement. Keep KV in RAM.
 
+## Images (CPU encoder)
+
+Setup does not offer images for this file ("not wired yet", #967) but it works by hand, as several users reported.
+The model is text-only: `--vision` on the engine plus a `"vision"` block make `strata-vision` run the shared
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` encoder and hand the image tokens to the engine. Here the encoder runs **on the
+CPU** (`"gpu": false`, 12 threads, up to 1024 image tokens), so it costs no VRAM and the expert caches are unchanged.
+
+- Build the helper from this checkout, CPU only: `cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DLLAMA_DIR=<build/_deps/strata_llamacpp-src> -DSTRATA_VISION_CUDA=OFF && cmake --build build-vision`.
+- `"model"` is shard 1 of the four: the helper opens it vocab-only, and shard 1 carries the vocabulary.
+- Measured: about 6 s per small image on this CPU (196 tokens), 8-10 s end to end through the API; a red circle and a
+  blue square were described correctly, also under the `qwen3.8-27b` alias name. One smoke test, not an image benchmark.
+
 ## Not verified
 
 - Greedy output is not reproducible run to run (solo or slot): the adaptive expert cache moves experts between GPU
   and CPU compute (DETAILS.md documents `--adapt-every 100000` for reproducible output). The solo-vs-slot exactness
   of the pool was therefore not testable; cross-lane isolation was (distinct needles).
 - `--pipeline-windows 2`, `STRATA_PREFILL_HELP`, chunk size and `--pcie-frac` tuning; `k8v4` with the pool; parking and
-  session files with the pool; YaRN at 512k; images (this file has no vision wiring in setup).
+  session files with the pool; YaRN at 512k.
 - Only CUDA was compiled (the HIP `block()` path of the pool is untested).
