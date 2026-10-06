@@ -2,7 +2,7 @@
 
 This is the setup the `kv-shared-pool` branch of this fork was built for: Unsloth **UD-Q4_K_XL** (111 GB) on
 two RTX 3080 20 GB (PCIe 3.0 x16, no NVLink, no P2P, one NUMA node) with about 100 GiB of usable pinned RAM
-and a Xeon E5-2696 v4 (AVX2 only), a **524,288-token KV pool shared by four lanes of up to 262,144 tokens each**,
+and a Xeon E5-2696 v4 (AVX2 only), a **524,288-token KV pool shared by two lanes of up to 262,144 tokens each**,
 and **no SSD or HDD read while serving**. The model sits on a spinning-disk pool, so any page-fault read of an
 expert or PLE row is a failure of the goal, not a slowdown.
 
@@ -33,7 +33,7 @@ the arena mode (every expert in RAM, 71.7 + 26.8 GiB) cannot fit and the residen
 --prefill auto --spec 4 --spec-min-p 0.5 --mtp <mtp/rt>
 --max-context 262144 --kv int8 --kv-resident 32768 --kv-pool-tokens 524288
 --resident-experts --ple-io ram --trim-stage-weights --vram-reserve-mib 1100
-"parallel": 4, "layer_split": "24", "gpu": [0, 1]
+"parallel": 2, "layer_split": "24", "gpu": [0, 1]
 ```
 
 - **Explicit `layer_split`**, not `auto`: auto can pick a split the prompt path cannot start at long contexts (#1094).
@@ -55,12 +55,12 @@ the arena mode (every expert in RAM, 71.7 + 26.8 GiB) cannot fit and the residen
 | Decode, short context | 42-44 tok/s |
 | Decode after a 27k context | 55-58 tok/s |
 | Prefill, 5k / 27k / 113k / 232k tokens | 870-936 / 1,571-1,647 / 2,098-2,199 / 2,068 tok/s |
-| 4 concurrent streams | 36.6 tok/s aggregate (about 10 each; batch slots decode without MTP on a split) |
+| 4 concurrent streams (measured on a `"parallel": 4` build of this config) | 36.6 tok/s aggregate (about 10 each; batch slots decode without MTP on a split) |
 | Disk read by the engine, all phases | 0-8 MiB per phase (140 MiB in a benchmark whose startup read 133 GB) |
 
 Measured with `/proc/<engine pid>/io` `read_bytes` around each phase (mmap page-fault reads are counted there).
 
-Pool stress: four concurrent 133,865-token prompts (556k tokens against a 524k pool, with a 233k conversation
+Pool stress (measured with `"parallel": 4`): four concurrent 133,865-token prompts (556k tokens against a 524k pool, with a 233k conversation
 already held) all answered 200 and each lane returned **its own** needle; the "KV pool full: slot N gives back its
 cached conversation" eviction path ran; moving a 134k-token conversation between the main session and a slot took
 about 0.2 s (chunk-table swap, no copy).
