@@ -32,7 +32,7 @@
     "--vram-reserve-mib",
     "1100"
   ],
-  "parallel": 4,
+  "parallel": 2,
   "tokenizer": "packs/ud-q4_k_xl/tokenizer",
   "model_name": "qwen3.8-flash-next-ud-q4_k_xl",
   "gpu": [
