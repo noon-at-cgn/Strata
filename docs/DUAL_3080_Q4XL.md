@@ -65,6 +65,26 @@ already held) all answered 200 and each lane returned **its own** needle; the "K
 cached conversation" eviction path ran; moving a 134k-token conversation between the main session and a slot took
 about 0.2 s (chunk-table swap, no copy).
 
+## Production benchmark (the shipped config: 2 lanes, vision on, authenticated)
+
+One run per row on the live service, each context on a fresh unique haystack (no prefix-cache hits), MTP on,
+greedy, 160-token story for decode. Prefill is TTFT over prompt tokens.
+
+| context | TTFT | prefill | decode | needle |
+|---|---|---|---|---|
+| short (23 tok) | 0.1-0.2 s | - | 53 tok/s (first run; 66 and 73 on identical repeats) | - |
+| 4.6k | 5.5 s | 836 tok/s | 50.9 tok/s | ok |
+| 23k | 13.9 s | 1,667 tok/s | 66.6 tok/s | ok |
+| 96k | 45.1 s | 2,131 tok/s | 65.9 tok/s | ok (100k) |
+| 193k | 89.9 s | 2,150 tok/s | 60.8 tok/s | ok (201k) |
+| 2 concurrent streams | - | - | 21-26 tok/s each, 40-43.5 tok/s aggregate | - |
+| one image, CPU encoder, end to end | 3.0-3.3 s warm | - | - | red circle, blue square correct |
+
+Disk read by the engine: 0 MiB in every phase except 1 MiB at 193k. MTP: 1,956 of 2,701 drafts accepted (72%).
+`MemAvailable` 27.6 GiB afterwards, `oom_kill` unchanged. Caveats: single runs; synthetic repetitive text; identical
+repeats speed up because the adaptive expert cache learns the prompt, so the first run is the honest short figure;
+with two lanes active the batch slots decode without MTP, so two users each get about 23 tok/s, less than one user alone.
+
 ## KV in RAM or in VRAM
 
 Same config, one lane, `--max-context 262144`, only `--kv-resident` differs:
