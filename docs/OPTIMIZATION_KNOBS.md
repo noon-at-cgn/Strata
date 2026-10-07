@@ -1,6 +1,6 @@
 # Optimization knobs on this branch
 
-This branch (`opt-int`) combines four sets of changes made for the production A/B. Every change that has an
+This branch (`opt-w2`: `opt-pipe` plus `w2-pathb`, `w2-affinity` and `w2-kernel`) combines the sets of changes made for the production A/B. Every change that has an
 on/off switch is listed here with its default, how to set it for the whole engine, how to set it per request
 (through the server's `strata_tune` field, so you can compare without a restart), what it changes, and which log
 line to read. Nothing here has a measured speed-up attached: the numbers have to come from your own A/B on the
@@ -43,6 +43,15 @@ How the per-request keys behave:
   every setting gives the same bits, two requests with different values running together can only differ in speed.
 - The server in front of the engine (`serve/server.py`) must be the one from this branch, or it drops the new keys
   (`aux_cpus`, `cpu_kernel`, `pool_drain`; it forwards only the keys it knows).
+- Restart-only knobs in this branch (no `strata_tune` key; they need an engine restart): `STRATA_VERIFY_FLAGB`,
+  `STRATA_LOOKAHEAD_RECALL` (and `_K`, `_EVERY`). Per-request keys: `pcie_frac` (0 selects the graph without the PCIe
+  part), `aux_cpus`, `cpu_kernel`, `pool_drain`. `--aux-cpus`, `--cpu-kernel` and `--pool-drain` are also start-up flags.
+- At start the engine prints one line per start-up setting to read first: `strata aux cpus: ...` (placement),
+  `strata generate: CPU expert rows (Q4_K / Q5_1) on the <ggml|kq256|fast> kernel; the pool drains a layer <in three
+  barriered phases|with per-expert counters (no barriers)>` (kernel and drain after the flags and variables are applied).
+- The settings do not depend on each other: `cpu_kernel` and `pool_drain` change which CPU code computes the expert rows
+  (same bits), `aux_cpus` moves the threads that are not the pool's, `pcie_frac` 0 changes the captured window graph. An A/B
+  of one of them against the production flags changes nothing else; a combined arm changes all that it names.
 
 An A/B of `--pcie-balance` with the production flags (`--pcie-frac 0.1`) without a restart:
 
