@@ -1059,6 +1059,13 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(pipeline_gate_test src/program/pipeline_gate_test.cpp)
   target_include_directories(pipeline_gate_test PRIVATE include)
   add_test(NAME pipeline_gate_test COMMAND pipeline_gate_test)
+  # a software model of the two layer-split stages and --pipeline-windows 2 (header-only, CPU): its invariants, and `stage_sim`
+  # printing the predicted ms/window per on-path share, to be compared with the live `strata pipeline:` line
+  add_executable(stage_sim_test src/program/stage_sim_test.cpp)
+  target_include_directories(stage_sim_test PRIVATE include)
+  add_test(NAME stage_sim_test COMMAND stage_sim_test)
+  add_executable(stage_sim src/program/stage_sim_cli.cpp)
+  target_include_directories(stage_sim PRIVATE include)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
