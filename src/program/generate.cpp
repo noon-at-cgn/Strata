@@ -8523,6 +8523,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            int req_q8k_avx2 = -1;   // q8k_avx2=0|1: the CPU experts' Q8_K activation quantizer (same bytes; -1 = the start-up value)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8548,6 +8549,7 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "q8k_avx2") req_q8k_avx2 = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9387,6 +9389,10 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            {   // q8k_avx2=: byte-identical either way; with batch slots the latest admitted request's value holds for the windows
+                static const bool q8k_start = strata::kernels::cpu::native_q8k_avx2();
+                strata::kernels::cpu::native_set_q8k_avx2(req_q8k_avx2 < 0 ? q8k_start : req_q8k_avx2 != 0);
+            }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)

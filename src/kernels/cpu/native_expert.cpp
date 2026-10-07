@@ -11,6 +11,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -73,11 +74,18 @@ namespace {
 // and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
 // iq_avx2.cpp is compiled for AVX2 (an AVX-only CPU, or STRATA_FORCE_ISA=avx, keeps ggml's).  STRATA_NO_Q8K_AVX2=1:
 // ggml's on any CPU.
+std::atomic<bool>& q8k_avx2_flag() {
+    static std::atomic<bool> on{cpu_avx2_ok() && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr};
+    return on;
+}
 bool q8k_avx2(int type) {
-    static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
-    return on && type == (int) GGML_TYPE_Q8_K;
+    return type == (int) GGML_TYPE_Q8_K && q8k_avx2_flag().load(std::memory_order_relaxed);
 }
 }  // namespace
+
+// Both quantizers write the same bytes, so the switch may flip at any time, even while the pool is running.
+void native_set_q8k_avx2(bool on) { q8k_avx2_flag().store(on && cpu_avx2_ok(), std::memory_order_relaxed); }
+bool native_q8k_avx2() { return q8k_avx2_flag().load(std::memory_order_relaxed); }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
