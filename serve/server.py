@@ -934,6 +934,12 @@ class StrataEngine:
             pb = tune.get("pcie_balance")
             if isinstance(pb, bool) or (isinstance(pb, (int, float)) and pb in (0, 1)):
                 keys += f" pcie_balance={int(pb)}"
+            # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on the
+            # spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a spare CPU
+            # ignores a 1).  Anything else is not sent.
+            ac = tune.get("aux_cpus")
+            if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
+                keys += f" aux_cpus={int(ac)}"
             # --pipeline-windows for this request: 0 decodes it serially, 2 in the pipelined loop (only when the engine was
             # started with --pipeline-windows 2).  Whole numbers 0 and 2; anything else is not sent.
             pw = tune.get("pipeline_windows")

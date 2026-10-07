@@ -24,6 +24,7 @@
 #include <cstdio>
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/door_latency.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/verify_variant.hpp"
@@ -274,12 +275,24 @@ public:
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
+    /// STRATA_SPLIT_TIMING: how long the host took from seeing each layer's doorbell to raising flag A, over every layer
+    /// served since the start (a request's numbers: `door_lat.since(copy taken at its start)`)
+    DoorLatency door_lat;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
+    /// the doorbell -> flag A timing (door_latency.hpp): `door_seen` when the host sees a layer's ring, `flag_a_raised` when
+    /// the plan flag goes up for it (the first call after a ring counts, the others are ignored)
+    void door_seen(std::chrono::steady_clock::time_point at) { door_ns_ = at.time_since_epoch().count(); }
+    void flag_a_raised() {
+        if (door_ns_ == 0) return;
+        door_lat.add(std::chrono::steady_clock::now().time_since_epoch().count() - door_ns_);
+        door_ns_ = 0;
+    }
+    int64_t door_ns_ = 0;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
