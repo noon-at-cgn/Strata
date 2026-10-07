@@ -181,6 +181,28 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    /// How run_split_multi_native drains a layer.  Both modes run every row of every expert on the same kernels, and a
+    /// row's result does not depend on the row range it is computed in, so the outputs are bit-identical; only the
+    /// scheduling differs.
+    ///   Barriered: three phases (gate/up rows, the host quantizes every intermediate, down rows), each published,
+    ///              drained, waited for and re-parked - the original behaviour and the default.
+    ///   Counters:  one publish per layer.  Every thread (the host too when host_works) claims gate/up row chunks of
+    ///              any expert from per-expert atomic counters; the thread that finishes an expert's last gate/up chunk
+    ///              quantizes its intermediate and opens its down chunks; the thread that finishes the layer's last
+    ///              down chunk raises the completion flag.  No barrier, no serial quantize phase between the stages.
+    /// Safe to change at any time from any thread: it is read once at the start of each call, and a call finishes
+    /// (every worker parked) before it returns.  STRATA_POOL_DRAIN=barriered|counters sets the start-up value.
+    enum class LayerDrain : int { Barriered = 0, Counters = 1 };
+    void set_layer_drain(LayerDrain m) { layer_drain_.store((int) m, std::memory_order_relaxed); }
+    LayerDrain layer_drain() const { return (LayerDrain) layer_drain_.load(std::memory_order_relaxed); }
+    /// Rows per chunk of the Counters drain (gate/up, down); multiples of 4 keep the row-interleaved kernels at four
+    /// rows per pass.  STRATA_POOL_GU_ROWS / STRATA_POOL_DOWN_ROWS set the start-up values (defaults 20 and 80).
+    void set_layer_chunks(int gu_rows, int down_rows);
+    /// The Counters drain's totals since construction: layers, and the milliseconds from the publish to the call's end (the
+    /// last claimed ticket's holder out of the layer) / of those, the time after the host's own share (with host_works, the
+    /// completion flag) until the last holder left.
+    int64_t counter_layers = 0;
+    double ms_counter_layer = 0, ms_counter_tail = 0;
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -292,6 +314,25 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // the Counters drain's layer description (run_split_multi_native fills it before the publish; mode 7)
+    struct alignas(64) LayerExpert {
+        std::atomic<int> gu_next{0};      // next gate/up chunk to claim
+        std::atomic<int> gu_done{0};      // gate/up chunks finished
+        std::atomic<int> down_open{0};    // 1 once the intermediate is quantized
+        std::atomic<int> down_next{0};    // next down chunk to claim
+        std::atomic<int> down_done{0};    // down chunks finished
+    };
+    std::unique_ptr<LayerExpert[]> lexp_;   // kMaxSplitMulti of them
+    alignas(64) std::atomic<int> lexp_down_done_{0};   // experts whose down rows are all done
+    alignas(64) std::atomic<uint32_t> layer_done_{0};  // raised by the last down chunk of the layer; the host's and the workers' exit
+    int l_n_ = 0, l_gu_rows = 20, l_down_rows = 80, l_gu_chunks = 0, l_down_chunks = 0;
+    std::atomic<int> layer_drain_{0};
+    void layer_work(int start);
+    void run_layer_counters(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    // one native chunk of expert e (rows [r0, r1)) / the expert's intermediate quantization: the bodies of modes 5 and 6
+    void native_gu_chunk(int e, int r0, int r1);
+    void native_quant_expert(int e);
+    void native_down_chunk(int e, int r0, int r1);
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };

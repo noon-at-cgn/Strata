@@ -17,6 +17,15 @@ void kq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 void kq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 
+/// The throughput-arranged form of the same arithmetic ("fast"): Q4_K (12) gate/up against Q8_K and Q5_1 (7) rows
+/// against Q8_1, several rows and tokens per pass over the activation, bit-identical to ggml's vec_dot for every token
+/// and row, any nt >= 1 and any row range.  Same argument conventions as kq256_gu_rows / kq256_rows.
+bool kqfast_supported(int ggml_type) noexcept;
+void kqfast_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                    int nt, float* const* ff, int r0, int r1);
+void kqfast_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                 float* const* out, int r0, int r1);
+
 /// out[r] = w_r . x for BF16 rows (bits), fp32 x: the routing-aware prefetch's router (an estimate only).
 void bf16_rows_dot(const uint16_t* w, int rows, int cols, const float* x, float* out);
 /// The same for `nt` <= 8 tokens (x: nt rows of cols, cols % 8 == 0), out[t * rows + r].

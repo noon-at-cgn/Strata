@@ -1248,6 +1248,30 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
   endif()
+  # Unsloth UD-Q4_K_XL's CPU expert rows (Q4_K gate/up, Q5_1 down): the kq256 / fast AVX-2 kernels and the engine's
+  # dispatch bit for bit against ggml-cpu's vec_dot at 1..8 tokens and partial row ranges (memcmp); --bench: GB/s per
+  # core and aggregate, the weights streamed from DRAM (run it on the CPU that runs the pool).  No GPU, no model.
+  add_executable(kq_fast_parity src/kernels/cpu/kq_fast_parity.cpp)
+  target_link_libraries(kq_fast_parity PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME kq_fast_parity COMMAND kq_fast_parity)
+    # the start-up mode each environment setting gives (STRATA_KQ256=1 keeps meaning kq256; STRATA_KQ_KERNEL wins over it)
+    add_test(NAME kq_fast_parity_env_default COMMAND kq_fast_parity --expect-kernel 0)
+    add_test(NAME kq_fast_parity_env_kq256_legacy COMMAND ${CMAKE_COMMAND} -E env STRATA_KQ256=1 $<TARGET_FILE:kq_fast_parity> --expect-kernel 1)
+    add_test(NAME kq_fast_parity_env_fast COMMAND ${CMAKE_COMMAND} -E env STRATA_KQ_KERNEL=fast $<TARGET_FILE:kq_fast_parity> --expect-kernel 2)
+    add_test(NAME kq_fast_parity_env_wins COMMAND ${CMAKE_COMMAND} -E env STRATA_KQ256=1 STRATA_KQ_KERNEL=ggml $<TARGET_FILE:kq_fast_parity> --expect-kernel 0)
+  endif()
+  # the expert pool's Barriered and Counters layer drains on a native Unsloth layer, bit for bit against a single-thread
+  # reference at random layer shapes, worker counts and chunk sizes, switching drain and row kernel between layers;
+  # --bench: ms per layer / per distinct expert on the real pinned pool.  No GPU, no model.
+  add_executable(pool_layer_test src/kernels/cpu/pool_layer_test.cpp)
+  target_link_libraries(pool_layer_test PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME pool_layer_test COMMAND pool_layer_test)
+    set_tests_properties(pool_layer_test PROPERTIES TIMEOUT 300)
+    add_test(NAME pool_layer_test_env_default COMMAND pool_layer_test --expect-drain 0)
+    add_test(NAME pool_layer_test_env_counters COMMAND ${CMAKE_COMMAND} -E env STRATA_POOL_DRAIN=counters $<TARGET_FILE:pool_layer_test> --expect-drain 1)
+  endif()
   # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
   add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
   target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)

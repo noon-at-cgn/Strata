@@ -945,6 +945,14 @@ class StrataEngine:
             pw = tune.get("pipeline_windows")
             if isinstance(pw, int) and not isinstance(pw, bool) and pw in (0, 2):
                 keys += f" pipeline_windows={pw}"
+            # the CPU experts' Q4_K / Q5_1 row kernels and the expert pool's layer drain for this request (same output bits
+            # whichever is chosen; they differ in speed only).  Exact words; anything else is not sent.
+            ck = tune.get("cpu_kernel")
+            if ck in ("ggml", "kq256", "fast"):
+                keys += f" cpu_kernel={ck}"
+            pd = tune.get("pool_drain")
+            if pd in ("barriered", "counters"):
+                keys += f" pool_drain={pd}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
