@@ -1250,9 +1250,11 @@ class SamplingKeys(unittest.TestCase):
             self.assertFalse([k for k in self.keys(temperature=0.7, top_k=bad) if k.startswith("top_k=")], bad)
 
     def test_tune_keys(self):
-        k = self.keys(temperature=0, strata_tune={"pcie_frac": 0.2, "spec_min_p": 0.7})
+        k = self.keys(temperature=0, strata_tune={"pcie_frac": 0.2, "spec_min_p": 0.7, "q8k_avx2": 0, "batch_overlap": 1})
         self.assertIn("pcie_frac=0.2", k)
         self.assertIn("spec_min_p=0.7", k)
+        self.assertIn("q8k_avx2=0.0", k)
+        self.assertIn("batch_overlap=1.0", k)
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
 
