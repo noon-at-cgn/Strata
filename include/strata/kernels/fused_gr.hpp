@@ -84,8 +84,11 @@ int fused_gr_variant();
 /// STRATA_HC_FUSED_ONE_LAUNCH=1, the whole read as one launch whose blocks wait for each other (CUDA, up to 4 rows for BF16).
 /// Every output is bit for bit the plain multi-launch read's.  This runs both on random weights on the current card (1..8
 /// tokens, with and without the pending write, launched twice) - the BF16 read (staged variant), or with `q8` the Q8_0 read
-/// STRATA_HC_Q8 selects - and says false, printing why, if they differ by one bit or a launch does not finish as it should;
-/// the caller then does not set `hc_sync`.  Once per card and form.  Always false off CUDA.
+/// STRATA_HC_Q8 selects - and says false, printing why, if they differ by one bit, or a launch does not finish as it should, or
+/// the launch does not fit the card: any CUDA error of the check (a launch, a copy, an allocation) is the answer "not used", never
+/// an exit.  The caller then does not set `hc_sync`.  Once per card and form.  Always false off CUDA.
+/// A read with `hc_sync` that fails to launch later is repeated as the plain read for that call (the same bits); logged once per
+/// device and token count.
 bool fused_gr_fused_check(bool q8);
 
 }  // namespace strata::kernels

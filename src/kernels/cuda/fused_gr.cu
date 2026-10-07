@@ -1164,8 +1164,12 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
-bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
+// The launches of fused_gr_read_multi.  `hc_err` (the start-up check of STRATA_HC_FUSED=1 only): when a read that carries
+// `hc_sync` fails to launch, return at once with the error in *hc_err - no fallback, no exit - so that the check can tell
+// "the fused read does not run here" from "it ran".  Without it a failed fused launch is repeated as the plain read (the same
+// bits, which the check proved) for that call; any other failure is fatal as it always was.
+static bool fused_gr_read_multi_impl(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                                     unsigned long long* stamp_buf, int stamp_i0, cudaError_t* hc_err) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -1190,9 +1194,30 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
+    enum class HcFail { kFatal, kRetryPlain, kReported };
+    auto hc_failed = [&](cudaError_t e) {
+        if (hc_err != nullptr) { *hc_err = e; return HcFail::kReported; }   // the start-up check: any failure is its answer
+        if (m.a[0].hc_sync == nullptr) return HcFail::kFatal;   // not a counters read: the caller's error handling
+        static std::atomic<unsigned> noted[64];   // per device: the token counts already reported (bit n_tok)
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev >= 0 && dev < 64 && (noted[dev].fetch_or(1u << n_tok) & (1u << n_tok)) == 0)
+            std::fprintf(stderr, "strata hc: CUDA%d: the STRATA_HC_FUSED read did not launch for %d token(s) (%s): the plain "
+                                 "read, the same bits, is used for those calls\n", dev, n_tok, cudaGetErrorString(e));
+        m.a[0].hc_sync = nullptr;
+        return HcFail::kRetryPlain;
+    };
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
-        const cudaError_t eq = cudaGetLastError();
+        cudaError_t eq = cudaGetLastError();
+        if (eq != cudaSuccess) {
+            const HcFail f = hc_failed(eq);
+            if (f == HcFail::kReported) return q8;
+            if (f == HcFail::kRetryPlain) {
+                launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);
+                eq = cudaGetLastError();
+            }
+        }
         if (eq != cudaSuccess) {
             std::fprintf(stderr, "fused_gr_read_multi q8: %s\n", cudaGetErrorString(eq));
             std::exit(1);
@@ -1291,24 +1316,39 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 #endif
 #if !defined(__HIPCC__)
     // STRATA_HC_FUSED_ONE_LAUNCH=1: the staged read's three launches as one, for the windows it carries (up to F1_MAX_T tokens)
-    if (a[0].hc_sync != nullptr && hc_one_launch() && n_tok <= F1_MAX_T && !gr_no_multi() && fused_gr_variant() >= kHcStaged) {
+    if (m.a[0].hc_sync != nullptr && hc_one_launch() && n_tok <= F1_MAX_T && !gr_no_multi() && fused_gr_variant() >= kHcStaged) {
         launch_f1(m, st, stamp_buf, stamp_i0);
         const cudaError_t e1 = cudaGetLastError();
-        if (e1 != cudaSuccess) {
+        if (e1 == cudaSuccess) return q8;
+        const HcFail f = hc_failed(e1);   // (the plain read below, without the counters, when it can be)
+        if (f == HcFail::kReported) return q8;
+        if (f == HcFail::kFatal) {
             std::fprintf(stderr, "fused_gr_read_multi fused: %s\n", cudaGetErrorString(e1));
             std::exit(1);
         }
-        return q8;
     }
 #endif
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
-    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0, a[0].hc_sync != nullptr);
-    const cudaError_t e = cudaGetLastError();
+    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0, m.a[0].hc_sync != nullptr);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        const HcFail f = hc_failed(e);
+        if (f == HcFail::kReported) return q8;
+        if (f == HcFail::kRetryPlain) {
+            launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0, false);
+            e = cudaGetLastError();
+        }
+    }
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
     return q8;
+}
+
+bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                         int stamp_i0) {
+    return fused_gr_read_multi_impl(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0, nullptr);
 }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
@@ -1534,11 +1574,18 @@ bool fused_launch_selftest(bool q8, std::string& why) {
     const float* d_R0 = (const float*) dev(h_R.data(), h_R.size() * 4);
     const float* d_bo = (const float*) dev(h_bo.data(), h_bo.size() * 4);
     const float* d_ip = (const float*) dev(h_ip.data(), h_ip.size() * 4);
+    // One allocation per set: the check poisons a set's outputs and scratch with ONE memset over the set, so they must be one
+    // range - separate cudaMallocs are not adjacent in a process whose heap is not fresh (the memset then fails with "invalid
+    // argument", which the engine's start-up used to take for a failed read and exit on).
+    const size_t set_floats = (size_t) TM * (D + 2 * D + LR + HC + HC + N);   // R_out, xn (2 planes), lo, rs, inject, mixed
     struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; } set[2];
     for (Set& x : set) {
-        x.R_out = (float*) dev(nullptr, (size_t) TM * D * 4); x.xn = (float*) dev(nullptr, (size_t) TM * D * 2 * 4);
-        x.lo = (float*) dev(nullptr, (size_t) TM * LR * 4); x.rs = (float*) dev(nullptr, (size_t) TM * HC * 4);
-        x.inj = (float*) dev(nullptr, (size_t) TM * HC * 4); x.mixed = (float*) dev(nullptr, (size_t) TM * N * 4);
+        x.R_out = (float*) dev(nullptr, set_floats * 4);
+        x.xn = x.R_out ? x.R_out + (size_t) TM * D : nullptr;
+        x.lo = x.xn ? x.xn + (size_t) TM * D * 2 : nullptr;
+        x.rs = x.lo ? x.lo + (size_t) TM * LR : nullptr;
+        x.inj = x.rs ? x.rs + (size_t) TM * HC : nullptr;
+        x.mixed = x.inj ? x.inj + (size_t) TM * HC : nullptr;
     }
     unsigned* d_sync = (unsigned*) dev(nullptr, sizeof(unsigned) * kFusedGrSyncWords);
     cudaStream_t st = nullptr;
@@ -1546,6 +1593,7 @@ bool fused_launch_selftest(bool q8, std::string& why) {
     bool ok = st != nullptr && d_down && d_up && d_inj && d_norm && d_R0 && d_bo && d_ip && d_sync && (!q8 || (d_q8_down && d_q8_up));
     for (const Set& x : set) ok = ok && x.R_out && x.xn && x.lo && x.rs && x.inj && x.mixed;
     if (!ok) { why = "no room for the check, or its set-up failed"; if (st) cudaStreamDestroy(st); return finish(false); }
+    cudaGetLastError();   // whatever an earlier call left behind is not this check's: its launches report their own errors
 
     std::vector<float> h1, h2;
     auto same = [&](const float* d1, const float* d2, size_t n, const char* what, int T, int apply, int rep) {
@@ -1570,8 +1618,11 @@ bool fused_launch_selftest(bool q8, std::string& why) {
         for (int T = 1; T <= TM && ok; ++T) {
             for (int rep = 0; rep < 2 && ok; ++rep) {
                 for (int v = 0; v < 2; ++v) {   // 0: the launches it replaces, 1: the one launch
-                    const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
-                    ok = ok && cudaMemset(set[v].R_out, 0xFF, span) == cudaSuccess;   // the whole set: poison
+                    if (cudaMemset(set[v].R_out, 0xFF, set_floats * 4) != cudaSuccess) {   // the whole set: poison
+                        why = "poisoning the check's buffers failed";
+                        ok = false;
+                        break;
+                    }
                     FusedGrArgs a[TM];
                     for (int k = 0; k < T; ++k) {
                         FusedGrArgs& x = a[k];
@@ -1583,8 +1634,19 @@ bool fused_launch_selftest(bool q8, std::string& why) {
                         x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
                         x.hc_sync = v == 1 ? d_sync : nullptr;
                     }
-                    fused_gr_read_multi(a, T, set[v].xn, st);
+                    // the engine's own entry (same kernels, same launch code), but a launch error comes back to us
+                    cudaError_t le = cudaSuccess;
+                    fused_gr_read_multi_impl(a, T, set[v].xn, st, nullptr, 0, &le);
+                    if (le != cudaSuccess) {
+                        char buf[200];
+                        std::snprintf(buf, sizeof buf, "%s did not launch for %d token(s)%s: %s", v == 1 ? "the one-launch read" : "the plain read",
+                                      T, apply ? " with the pending write" : "", cudaGetErrorString(le));
+                        why = buf;
+                        ok = false;
+                        break;
+                    }
                 }
+                if (!ok) break;
                 if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
                     why = "a kernel of the check failed";
                     ok = false;
