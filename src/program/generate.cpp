@@ -7984,6 +7984,28 @@ int main(int argc, char** argv) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
+            // --batch-overlap: the slot drafts are launched one after another (each drafter's graphs wait for the previous
+            // drafter's, so they still run in turn on the GPU) and collected together once all are launched, instead of
+            // each one waiting for its own to finish before the next starts.
+            const bool overlap_drafts = batch_mtp && strata::core::Verifier::batch_overlap();
+            int pending_draft[strata::kernels::kVerifyMaxT] = {};
+            int n_pending_draft = 0;
+            cudaEvent_t prev_draft = nullptr;
+            auto collect_drafts = [&]() -> bool {
+                bool ok = true;
+                for (int i = 0; i < n_pending_draft; ++i) {
+                    const int b = pending_draft[i];
+                    std::string de;
+                    if (slot_mtp[(size_t) b]->draft_end(bs[(size_t) b].draft.data(), de)) {
+                        bs[(size_t) b].draft_ready = true;
+                    } else if (ok) {
+                        std::printf("ERR batch MTP slot %d: %s\n", b, de.c_str());
+                        ok = false;
+                    }
+                }
+                n_pending_draft = 0;
+                return ok;
+            };
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -8013,17 +8035,33 @@ int main(int argc, char** argv) {
                     // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
                     const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
-                                        ver.final_R_all() + (size_t) first[t] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
-                                        slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
-                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
-                        return false;
+                    const bool copied = cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                                        ver.final_R_all() + (size_t) first[t] * stride,
+                                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                                        slot_mtp[(size_t) b]->stream()) == cudaSuccess;
+                    if (overlap_drafts) {   // --batch-overlap: launched now, collected after the loop
+                        if (!copied ||
+                            !slot_mtp[(size_t) b]->draft_begin(2, outb + first[t], pos[first[t]], keep[b] - 1, err, prev_draft)) {
+                            if (!copied) err = "the residual rows' copy to the drafter failed";
+                            (void) collect_drafts();   // nothing may run on behind the error
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        prev_draft = slot_mtp[(size_t) b]->done_event();
+                        pending_draft[n_pending_draft++] = b;
+                    } else {
+                        if (!copied || !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                                    sl.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        sl.draft_ready = true;
                     }
-                    sl.draft_ready = true;
                 }
+            }
+            if (overlap_drafts) {
+                std::fflush(stdout);   // the tokens leave while the drafts run
+                if (!collect_drafts()) return false;
             }
             pool_report();
             std::fflush(stdout);
@@ -8083,6 +8121,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
+                std::fprintf(stderr, "strata batch: --batch-overlap %s (the commits of all stages launched before one sync%s)\n",
+                             strata::core::Verifier::batch_overlap() ? "ON" : "off",
+                             batch_mtp ? ", the slot drafts launched back to back" : "");
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
@@ -8192,7 +8233,7 @@ int main(int argc, char** argv) {
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
-                const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+                const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
                 std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
                                      "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                              (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
@@ -8524,6 +8565,7 @@ int main(int argc, char** argv) {
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             int req_q8k_avx2 = -1;   // q8k_avx2=0|1: the CPU experts' Q8_K activation quantizer (same bytes; -1 = the start-up value)
+            int req_batch_overlap = -1;   // batch_overlap=0|1: --batch-overlap for the batch windows (-1 = the start-up value)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8550,6 +8592,7 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "q8k_avx2") req_q8k_avx2 = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "batch_overlap") req_batch_overlap = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9392,6 +9435,10 @@ int main(int argc, char** argv) {
             {   // q8k_avx2=: byte-identical either way; with batch slots the latest admitted request's value holds for the windows
                 static const bool q8k_start = strata::kernels::cpu::native_q8k_avx2();
                 strata::kernels::cpu::native_set_q8k_avx2(req_q8k_avx2 < 0 ? q8k_start : req_q8k_avx2 != 0);
+            }
+            if (o.batch > 0) {   // like pcie_frac, the latest admitted request's value holds for the batch windows after it
+                static const bool overlap_start = strata::core::Verifier::batch_overlap();
+                strata::core::Verifier::set_batch_overlap(req_batch_overlap < 0 ? overlap_start : req_batch_overlap != 0);
             }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one

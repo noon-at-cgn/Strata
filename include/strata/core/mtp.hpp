@@ -25,6 +25,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -91,6 +92,16 @@ public:
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// `draft` in two halves for --batch-overlap: `draft_begin` stages and launches the round (the plain, no-min_p path
+    /// only; the drafter's own stream) and returns without waiting; `draft_end` reads the outputs and syncs.  Several
+    /// drafters on one device can launch back to back and be collected afterwards.  `after`, when not null, is an event
+    /// of another drafter on this device that this drafter's stream waits for first, so their graphs still run one after
+    /// the other, as when each `draft` finished before the next began; `done_event()` is the event this launch records.
+    /// One begin, one end, nothing else of this drafter in between.
+    bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err, cudaEvent_t after = nullptr);
+    bool draft_end(int32_t* drafts, std::string& err, float* probs = nullptr, int* n_drafts = nullptr);
+    cudaEvent_t done_event() const { return ev_ser_; }
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
@@ -206,6 +217,16 @@ private:
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     cudaEvent_t ev_chain_ = nullptr;
+    cudaEvent_t ev_ser_ = nullptr;                      ///< draft_begin's "launched" marker (draft_begin's `after`)
+    struct PendingDraft {
+        bool live = false;
+        int T = 0, max_steps = 0;
+        int32_t tok_a = 0;                               ///< tokens[a], for the PLE prefetch
+        int32_t ple_prev[2] = {0, 0};
+        bool do_ple = false;
+        SessionState* pss = nullptr;
+        std::chrono::steady_clock::time_point t0;
+    } pend_;
     cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
