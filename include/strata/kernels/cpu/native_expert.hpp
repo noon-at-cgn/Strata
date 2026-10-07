@@ -43,6 +43,20 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 void native_set_q8k_avx2(bool on);
 bool native_q8k_avx2();
 
+/// Which row kernels the Q4_K gate/up and Q5_1 / Q8_0 down rows of Unsloth UD-Q4_K_XL experts run on.  All three give
+/// the same bits for every row and token, so the mode may change at any time (even while the pool runs).
+enum KqKernel : int {
+    kKqGgml = 0,   ///< ggml-cpu's one-token vec_dot per row and token (the default)
+    kKq256 = 1,    ///< the multi-token AVX-2 kernels, for groups of two or more tokens
+    kKqFast = 2,   ///< the row-interleaved AVX-2 kernels (kq_avx2.cpp) for groups of up to kKqFastMaxTokens tokens, kq256 for bigger ones
+};
+/// The largest group of tokens the "fast" kernels take in one pass (kq_avx2.cpp); bigger groups run on kq256.
+inline constexpr int kKqFastMaxTokens = 4;
+/// Start-up value: STRATA_KQ_KERNEL=ggml|kq256|fast (0|1|2); unset: STRATA_KQ256=1 -> kq256, else ggml.  A CPU without
+/// AVX-2 always runs ggml.  native_set_kq_kernel clamps an unknown mode to ggml.
+void native_set_kq_kernel(int mode);
+int native_kq_kernel();
+
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.
 int native_gu_mt_min(int gu_type);

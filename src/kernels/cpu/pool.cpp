@@ -446,6 +446,18 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     }
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
+    lexp_.reset(new LayerExpert[(size_t) kMaxSplitMulti]);
+    if (const char* e = std::getenv("STRATA_POOL_DRAIN")) {
+        const std::string s(e);
+        if (s == "counters" || s == "1") layer_drain_.store((int) LayerDrain::Counters, std::memory_order_relaxed);
+        else if (s != "barriered" && s != "0")
+            std::fprintf(stderr, "strata cpu pool: STRATA_POOL_DRAIN=%s is not barriered|counters; keeping barriered\n", e);
+    }
+    {
+        const char* g = std::getenv("STRATA_POOL_GU_ROWS");
+        const char* d = std::getenv("STRATA_POOL_DOWN_ROWS");
+        set_layer_chunks(g ? std::atoi(g) : l_gu_rows, d ? std::atoi(d) : l_down_rows);
+    }
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
@@ -605,6 +617,106 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
+// ---- the native layers' chunks (modes 5 and 6, and the Counters drain): one expert's rows [r0, r1)
+void ExpertPool::native_gu_chunk(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (q2_native_kernels(nfmt_->gu_type)) {
+        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
+        thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+        float* gp[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+        const int nbk = (int) (nfmt_->n_embd / 64);
+        q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+        q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+        for (int t = 0; t < mjobs_[e].nt; ++t)
+            for (int r = r0; r < r1; ++r)
+                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+    } else {
+        float* ff[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+        native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+    }
+}
+
+void ExpertPool::native_quant_expert(int e) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    for (int t = 0; t < mjobs_[e].nt; ++t)
+        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+}
+
+void ExpertPool::native_down_chunk(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (q2_native_kernels(nfmt_->d_type)) {
+        // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+        q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2, mjobs_[e].nt,
+                    mjobs_[e].out, r0, r1);
+    } else {
+        const void* hq[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+        native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    }
+}
+
+// ---- the Counters drain (mode 7).  Every thread runs this once per layer, from the doorbell to the completion flag.
+// A thread claims the next gate/up chunk of any expert (`gu_next`, one fetch_add); the thread whose chunk is an
+// expert's last (`gu_done` reaches the chunk count - every other chunk's rows were written before its own release
+// increment) quantizes the expert's intermediate and opens its down chunks (`down_open`, release); down chunks are
+// claimed the same way from the opened experts; the thread that finishes the layer's last down chunk raises `done_`
+// (release), the flag the host waits on - after which `out` is complete for the reader.  A thread with nothing to
+// claim spins on `done_`: no thread waits for another at a barrier, only for work that another is about to open.
+void ExpertPool::layer_work(int start) {
+    const int n = l_n_;
+    const int gu_rows = l_gu_rows, down_rows = l_down_rows, gu_chunks = l_gu_chunks, down_chunks = l_down_chunks;
+    int first = n > 0 ? start % n : 0;   // threads start at different experts: no one counter takes every first claim
+    for (;;) {
+        bool any = false;
+        for (int k = 0; k < n; ++k) {
+            const int e = first + k < n ? first + k : first + k - n;
+            LayerExpert& s = lexp_[(size_t) e];
+            if (s.gu_next.load(std::memory_order_relaxed) >= gu_chunks) continue;
+            const int c = s.gu_next.fetch_add(1, std::memory_order_acq_rel);
+            if (c >= gu_chunks) continue;
+            any = true;
+            native_gu_chunk(e, c * gu_rows, (std::min)(FF, (c + 1) * gu_rows));
+            if (s.gu_done.fetch_add(1, std::memory_order_acq_rel) == gu_chunks - 1) {
+                native_quant_expert(e);
+                s.down_open.store(1, std::memory_order_release);
+            }
+        }
+        if (!any) break;
+    }
+    for (;;) {
+        bool any = false;
+        for (int k = 0; k < n; ++k) {
+            const int e = first + k < n ? first + k : first + k - n;
+            LayerExpert& s = lexp_[(size_t) e];
+            if (!s.down_open.load(std::memory_order_acquire)) continue;
+            if (s.down_next.load(std::memory_order_relaxed) >= down_chunks) continue;
+            const int c = s.down_next.fetch_add(1, std::memory_order_acq_rel);
+            if (c >= down_chunks) continue;
+            any = true;
+            native_down_chunk(e, c * down_rows, (std::min)(H, (c + 1) * down_rows));
+            if (s.down_done.fetch_add(1, std::memory_order_acq_rel) == down_chunks - 1 &&
+                lexp_down_done_.fetch_add(1, std::memory_order_acq_rel) == n - 1)
+                layer_done_.store(1, std::memory_order_release);
+        }
+        if (!any) {
+            if (layer_done_.load(std::memory_order_acquire) != 0) break;
+            _mm_pause();
+        }
+    }
+}
+
+void ExpertPool::set_layer_chunks(int gu_rows, int down_rows) {
+    // multiples of four rows (the row-interleaved kernels' pass), at least one chunk's worth
+    l_gu_rows = (std::max)(4, (std::min)(FF, gu_rows / 4 * 4));
+    l_down_rows = (std::max)(4, (std::min)(H, down_rows / 4 * 4));
+}
+
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
     for (;;) {
@@ -624,41 +736,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
-        } else if (mode_ >= 5) {
+        } else if (mode_ == 7) {
+            layer_work(id);   // the Counters drain: this ticket's holder works on the layer until it is done
+        } else if (mode_ == 5 || mode_ == 6) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
-                SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (q2_native_kernels(nfmt_->d_type)) {
-                    // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                } else {
-                    const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                }
+                if (mode_ == 5) native_gu_chunk(e, r0, r1);
+                else native_down_chunk(e, r0, r1);
                 r += r1 - r0;
             }
         } else {
@@ -754,6 +842,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    if (n <= kMaxSplitMulti && layer_drain() == LayerDrain::Counters) { run_layer_counters(f, jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -840,6 +929,77 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     ms_wait_park_ += std::chrono::duration<double, std::milli>(t_b - t_a).count();
     ms_drain_ += std::chrono::duration<double, std::milli>(t_c - t_b).count();
     ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
+}
+
+void ExpertPool::run_layer_counters(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+    const auto t0 = std::chrono::steady_clock::now();
+    // No wait for the workers to be parked: a worker joins this layer by CLAIMING one of `n_` tickets from head_, a CAS
+    // that only succeeds for the epoch it woke for (issue #29), so a worker that is still asleep or late - and wakes
+    // after the layer, or into the next one - claims nothing of this layer.  A claimed ticket's holder is waited for
+    // below, so the description cannot change under it.
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    mode_ = 7;
+    l_n_ = n;
+    l_gu_chunks = (FF + l_gu_rows - 1) / l_gu_rows;
+    l_down_chunks = (H + l_down_rows - 1) / l_down_rows;
+    for (int e = 0; e < n; ++e) {
+        LayerExpert& s = lexp_[(size_t) e];
+        s.gu_next.store(0, std::memory_order_relaxed);
+        s.gu_done.store(0, std::memory_order_relaxed);
+        s.down_open.store(0, std::memory_order_relaxed);
+        s.down_next.store(0, std::memory_order_relaxed);
+        s.down_done.store(0, std::memory_order_relaxed);
+    }
+    lexp_down_done_.store(0, std::memory_order_relaxed);
+    layer_done_.store(0, std::memory_order_relaxed);
+    njobs_ = n_;
+    const uint32_t e = begin_batch(n_);   // done_ = 0, the tickets, the epoch (release): description first
+    hstate_.store(kWaitDone, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (host_works_) {
+        layer_work(n_);   // returns when layer_done_ is set
+    } else {
+        uint32_t spins = 0;
+        std::chrono::steady_clock::time_point ts{};
+        while (layer_done_.load(std::memory_order_acquire) == 0) {
+            _mm_pause();
+            if ((++spins & 1023u) != 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (spins == 1024u) ts = now;
+            else if (now - ts > kStall) {
+                std::fprintf(stderr, "strata: the CPU expert pool stalled in a layer (counters drain) - stopping the engine so "
+                                     "the server can start it again (issue #29)\n");
+                strata::core::release_gpu_waits(stderr);
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    // Close the batch: no ticket can be claimed after this, and the tickets already claimed are waited for.
+    uint32_t claimed = 0;
+    {
+        uint64_t h = head_.load(std::memory_order_acquire);
+        for (;;) {
+            const uint32_t nn = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+            if ((uint32_t) (h >> 32) != e || i >= nn) { claimed = (std::min)(i, nn); break; }   // all taken
+            if (head_.compare_exchange_weak(h, h + (nn - i), std::memory_order_acq_rel, std::memory_order_acquire)) {
+                claimed = i;
+                break;
+            }
+        }
+    }
+    wait_done((int) claimed);   // each holder of a ticket adds one when it leaves layer_work
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto t3 = std::chrono::steady_clock::now();
+    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    mode_ = 0;
+    ++counter_layers;
+    ms_counter_layer += std::chrono::duration<double, std::milli>(t3 - t0).count();
+    ms_counter_tail += std::chrono::duration<double, std::milli>(t3 - t1).count();
+    ms_drain_ += std::chrono::duration<double, std::milli>(t3 - t0).count();
 }
 
 }  // namespace strata::kernels::cpu
