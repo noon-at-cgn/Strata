@@ -1273,6 +1273,13 @@ class SamplingKeys(unittest.TestCase):
             self.assertFalse([x for x in k if x.split("=")[0] == "pipeline_windows"], bad)
         self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("pipeline_windows")])
 
+    def test_tune_pcie_frac_zero(self):
+        # pcie_frac 0 is the request the engine runs on the verify window graph WITHOUT flag B's wait and the PCIe group
+        # (docs/OPTIMIZATION_KNOBS.md): it must reach the engine as a number, not be dropped as "falsy"
+        for val in (0, 0.0):
+            self.assertIn("pcie_frac=0.0", self.keys(strata_tune={"pcie_frac": val}), val)
+        self.assertIn("pcie_frac=0.1", self.keys(strata_tune={"pcie_frac": 0.1}))
+
     def test_tune_pcie_balance(self):
         for val, want in ((True, "pcie_balance=1"), (1, "pcie_balance=1"), (False, "pcie_balance=0"), (0, "pcie_balance=0"),
                           (1.0, "pcie_balance=1"), (0.0, "pcie_balance=0")):
