@@ -438,7 +438,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
-    src/core/kv_chunks.cpp src/core/kv_pool.cpp)
+    src/core/kv_chunks.cpp src/core/kv_pool.cpp src/core/lookahead_recall.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
@@ -447,6 +447,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(exchange_storage_test PRIVATE Threads::Threads)
     add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
+  endif()
+  # the router lookahead's recall counter (STRATA_LOOKAHEAD_RECALL): the scoring against synthetic routers, CPU only
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/lookahead_recall_test.cpp")
+    add_executable(lookahead_recall_test tests/core/lookahead_recall_test.cpp)
+    target_link_libraries(lookahead_recall_test PRIVATE strata_engine)
+    add_test(NAME lookahead_recall_test COMMAND lookahead_recall_test)
+    set_tests_properties(lookahead_recall_test PROPERTIES TIMEOUT 60)
   endif()
   # the shared KV pool's logic (--kv-pool-tokens): chunk tables, the piece walk, who gives way - no GPU, no CUDA
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/kv_chunks_test.cpp")

@@ -1,6 +1,7 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/core/lookahead_recall.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -1522,35 +1523,8 @@ void RouterLookahead::run() {
         }
         const auto t0 = std::chrono::steady_clock::now();
         want.clear();
-        // The router dot is AVX2 (kq_avx2.cpp); a CPU without AVX2 (the experimental older-CPU builds) takes the AVX1
-        // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
-        // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
-        // prefetch); the order of the additions differs between the three, the output does not depend on it.
-        if (strata::kernels::cpu::cpu_avx2_ok()) {
-            strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                      x_.data(), (int) nt, logits.data());
-        } else if (strata::kernels::cpu::cpu_avx1_ok()) {
-            strata::kernels::cpu::bf16_rows_dot_multi_avx1(routers_[(size_t) layer].data(), (int) n_expert_,
-                                                           (int) n_embd_, x_.data(), (int) nt, logits.data());
-        } else {
-            // a mul and an add, not std::fma: without an FMA instruction that is a libm call per element (74x
-            // slower on a Xeon E5-2665, measured by the fork)
-            const uint16_t* rw = routers_[(size_t) layer].data();
-            for (int64_t r = 0; r < n_expert_; ++r) {
-                const uint16_t* wr = rw + (size_t) r * (size_t) n_embd_;
-                for (int64_t t = 0; t < nt; ++t) {
-                    const float* xr = x_.data() + (size_t) t * (size_t) n_embd_;
-                    float acc = 0.0f;
-                    for (int64_t c = 0; c < n_embd_; ++c) {
-                        const uint32_t bits = (uint32_t) wr[c] << 16;
-                        float wf;
-                        std::memcpy(&wf, &bits, sizeof wf);
-                        acc += wf * xr[c];
-                    }
-                    logits[(size_t) t * (size_t) n_expert_ + (size_t) r] = acc;
-                }
-            }
-        }
+        // the router dot on the CPU's best ISA (shared with the recall counter): lookahead_recall.cpp
+        router_logits_host(routers_[(size_t) layer].data(), n_expert_, n_embd_, x_.data(), nt, logits.data());
         for (int64_t t = 0; t < nt; ++t) {
             const float* lt = logits.data() + (size_t) (t * n_expert_);
             for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
@@ -2654,6 +2628,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (d.lookahead != nullptr) d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
+    if (d.recall != nullptr) d.recall->submit(d.layers, x_f, ids, n_tok, k, d.host_res);   // measurement only: the lookahead's recall
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
