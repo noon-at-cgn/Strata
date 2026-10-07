@@ -196,7 +196,7 @@ public:
     void set_layer_drain(LayerDrain m) { layer_drain_.store((int) m, std::memory_order_relaxed); }
     LayerDrain layer_drain() const { return (LayerDrain) layer_drain_.load(std::memory_order_relaxed); }
     /// Rows per chunk of the Counters drain (gate/up, down); multiples of 4 keep the row-interleaved kernels at four
-    /// rows per pass.  STRATA_POOL_GU_ROWS / STRATA_POOL_DOWN_ROWS set the start-up values (defaults 40 and 160).
+    /// rows per pass.  STRATA_POOL_GU_ROWS / STRATA_POOL_DOWN_ROWS set the start-up values (defaults 20 and 80).
     void set_layer_chunks(int gu_rows, int down_rows);
     /// The Counters drain's totals since construction: layers, and the milliseconds from the publish to the last worker
     /// parked (the call's whole duration) / of those, what the host waited for the completion flag after its own share.
@@ -324,7 +324,7 @@ private:
     std::unique_ptr<LayerExpert[]> lexp_;   // kMaxSplitMulti of them
     alignas(64) std::atomic<int> lexp_down_done_{0};   // experts whose down rows are all done
     alignas(64) std::atomic<uint32_t> layer_done_{0};  // raised by the last down chunk of the layer; the host's and the workers' exit
-    int l_n_ = 0, l_gu_rows = 40, l_down_rows = 160, l_gu_chunks = 0, l_down_chunks = 0;
+    int l_n_ = 0, l_gu_rows = 20, l_down_rows = 80, l_gu_chunks = 0, l_down_chunks = 0;
     std::atomic<int> layer_drain_{0};
     void layer_work(int start);
     void run_layer_counters(const NativeFmt& f, ExpertJobMulti* jobs, int n);
