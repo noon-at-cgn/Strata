@@ -1733,6 +1733,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     } help_scope{m, helped};
     PfTimer pt;
+    // STRATA_PREFILL_TIMING: the dense products' own GPU time (Gemm::set_timing), counted from here
+    m.gemm.set_timing(pt.on);
+    const double gemm_native_ms0 = m.gemm.timing_ms(0), gemm_bf16_ms0 = m.gemm.timing_ms(1);
+    const int64_t gemm_native_n0 = m.gemm.timing_calls(0), gemm_bf16_n0 = m.gemm.timing_calls(1);
     PeTimer pe;
     if (m.pp) pe.dev = m.pp->dev; else pe.on = false;
     const cudaStream_t cs = (cudaStream_t) m.cs;
@@ -2595,6 +2599,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         pt.fold();
+                        m.gemm.timing_fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
                         }
@@ -3329,6 +3334,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     stats_.ms_total += ms_since(t_start);
     if (pt.on) {
         pt.fold();
+        m.gemm.timing_fold();
         double total = 0.0;
         for (double v : pt.ms) total += v;
         std::string line;
@@ -3343,6 +3349,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        std::fprintf(stderr, "strata prefill timing: layers %lld-%lld dense products (GPU ms, summed over the calls): "
+                             "GGUF projections (dequantize + cuBLAS, or MMQ) %.0f in %lld calls, BF16 projections (hyper-connection, "
+                             "router, PLE) %.0f in %lld calls; dense MMQ %s (%lld products through MMQ, %lld through dequantize + "
+                             "cuBLAS since start)\n",
+                     (long long) LB, (long long) LE - 1, m.gemm.timing_ms(0) - gemm_native_ms0,
+                     (long long) (m.gemm.timing_calls(0) - gemm_native_n0), m.gemm.timing_ms(1) - gemm_bf16_ms0,
+                     (long long) (m.gemm.timing_calls(1) - gemm_bf16_n0), m.gemm.dense_mmq() ? "ON" : "off",
+                     (long long) m.gemm.dense_mmq_calls(), (long long) m.gemm.dense_cublas_calls());
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;

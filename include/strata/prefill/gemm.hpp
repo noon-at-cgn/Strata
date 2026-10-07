@@ -43,7 +43,8 @@ public:
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits
-    /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
+    /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_PREFILL_DENSE_MMQ=1, or
+    /// STRATA_DENSE_MMQ=1, read when the Gemm is set up; or set_dense_mmq).  The activations are rounded to q8_1 there.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
@@ -51,6 +52,21 @@ public:
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
     void set_f16_io(bool on) { f16_io_ = on; }
+
+    /// The dense-MMQ switch (see native): initialised from the environment by init / init_external.  false on a build
+    /// without the MMQ kernels, whatever it is told.
+    void set_dense_mmq(bool on);
+    bool dense_mmq() const { return dense_mmq_; }
+    /// native() products since set-up that went through MMQ / through dequantize + cuBLAS (STRATA_PREFILL_TIMING's line).
+    int64_t dense_mmq_calls() const { return dense_mmq_calls_; }
+    int64_t dense_cublas_calls() const { return dense_cublas_calls_; }
+
+    /// STRATA_PREFILL_TIMING: events around every native() and bf16() call (time_ms/calls kind 0 = native(), 1 = bf16()),
+    /// summed by timing_fold(), which the caller runs after synchronizing the compute stream.  Off by default.
+    void set_timing(bool on);
+    void timing_fold();
+    double timing_ms(int kind) const;
+    int64_t timing_calls(int kind) const;
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
@@ -78,6 +94,17 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    bool dense_mmq_ = false;
+    int64_t dense_mmq_calls_ = 0, dense_cublas_calls_ = 0;
+    static bool dense_mmq_env();
+    struct Timing;
+    Timing* timing_ = nullptr;
+    void time_begin(int kind);
+    void time_end();
+    void bf16_impl(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                   int64_t ldx);
+    void native_impl(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldy, float beta, int64_t ldx);
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };
