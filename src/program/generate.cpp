@@ -4593,6 +4593,13 @@ int main(int argc, char** argv) {
             err.clear();
         }
     }
+    // STRATA_LOOKAHEAD_RECALL=1|2 (off by default; a measurement, no prefetch, no change to any output): how often the
+    // routers of layers l+1 and l+2, applied to layer l's MoE input, name the experts those layers then route to - and,
+    // of the experts that were not in the GPU cache, how many.  Started below once every stage's weights exist; 2 adds
+    // the recall per layer.  STRATA_LOOKAHEAD_RECALL_K: the experts predicted per token (default: the routed count).
+    const int recall_level = [] { const char* v = std::getenv("STRATA_LOOKAHEAD_RECALL"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+    strata::core::LookaheadRecall recall;
+    int recall_k_pred = 10;   // the experts predicted per token, once the counter runs
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
@@ -6365,6 +6372,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
+                    if (recall_level > 0) ver_same.set_always_publish(true);
                     ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
@@ -6376,6 +6384,7 @@ int main(int argc, char** argv) {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
+                    if (recall_level > 0) gs.ver.set_always_publish(true);
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
@@ -6446,6 +6455,7 @@ int main(int argc, char** argv) {
             pl_pinned_extra += strata::core::Verifier::mapped_bytes() - pin_before;
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
+        if (recall_level > 0) ver.set_always_publish(true);   // the lookahead recall needs every layer's x rows (see Verifier::set_always_publish)
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -6456,6 +6466,37 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        if (recall_level > 0) {   // STRATA_LOOKAHEAD_RECALL: the host copies of every layer's router, whichever stage holds it
+            std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+            bool ok = !pipe;
+            std::string why = pipe ? "it needs serial windows (--pipeline-windows 0)" : "";
+            for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+                const std::string name = "blk." + std::to_string(l) + ".ffn_gate_inp.weight";
+                const strata::core::WeightRef* w = wt.find(name);
+                for (size_t s = 0; w == nullptr && s < stages.size(); ++s) w = stages[s]->wt.find(name);
+                ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                     w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+                if (!ok) { why = "layer " + std::to_string(l) + "'s router is not BF16 in an arena"; break; }
+                routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+                ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (!ok) why = "copying layer " + std::to_string(l) + "'s router";
+            }
+            const char* kv = std::getenv("STRATA_LOOKAHEAD_RECALL_K");
+            const int k_pred = kv != nullptr && std::atoi(kv) > 0 ? std::atoi(kv) : (int) K;
+            // one window in N is scored (default 3): the two router dots cost its thread ~1 ms a layer, a window is ~28 ms
+            const char* ev = std::getenv("STRATA_LOOKAHEAD_RECALL_EVERY");
+            const int every = ev != nullptr && std::atoi(ev) > 0 ? std::atoi(ev) : 3;
+            if (ok && recall.start(std::move(routers), g.n_embd, g.n_expert, k_pred, why, every)) {
+                drive.d.recall = &recall;
+                recall_k_pred = k_pred;
+                std::fprintf(stderr, "strata generate: STRATA_LOOKAHEAD_RECALL=%d: measuring the router lookahead's recall (top-%d of "
+                                     "layers l+1, l+2 from layer l's input, one window in %d; no prefetch, outputs unchanged; every "
+                                     "layer publishes its rows to the host)\n", recall_level, k_pred, every);
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata generate: STRATA_LOOKAHEAD_RECALL: off (%s)\n", why.c_str());
+            }
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -8206,6 +8247,7 @@ int main(int argc, char** argv) {
                 }
                 bt_door0.clear();
                 for (size_t k = 0; k <= stages.size(); ++k) bt_door0.push_back(stage_verifier((int) k).door_lat);
+                if (drive.d.recall != nullptr) recall.reset();   // a burst's windows only
                 bt_cpu_ent0 = drive.d.multi_entries; bt_off_ent0 = drive.d.offload_entries;
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
@@ -8401,6 +8443,8 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k <= stages.size() && k < bt_door0.size(); ++k)   // doorbell -> flag A, this burst's layers
                         std::fprintf(stderr, "strata batch: stage %zu doorbell -> flag A: %s\n", k + 1,
                                      strata::core::DoorLatency::describe(stage_verifier((int) k).door_lat.since(bt_door0[k])).c_str());
+                if (drive.d.recall != nullptr)   // STRATA_LOOKAHEAD_RECALL: the recall over this burst's windows
+                    std::fputs(strata::core::LookaheadRecall::format(recall.take(), recall_level, recall_k_pred).c_str(), stderr);
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
@@ -9759,6 +9803,7 @@ int main(int argc, char** argv) {
             }
             std::vector<strata::core::DoorLatency> door0;   // the doorbell histograms at this request's start (STRATA_SPLIT_TIMING)
             for (int st = 0; st < n_stages; ++st) door0.push_back(stage_ver(st).door_lat);
+            if (o.batch == 0 && drive.d.recall != nullptr) recall.reset();   // lookahead recall: this request's counts only
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // --pcie-balance (flag, env or this request's key): per stage, the link's DMA cost is measured between
             // windows (here, now, when it has never been or the last reading is over a minute old) and the pool's
@@ -11072,6 +11117,8 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: stage %d: doorbell -> flag A, this request: %s\n", st,
                                      strata::core::DoorLatency::describe(v.door_lat.since(door0[(size_t) st])).c_str());
                 }
+            if (drive.d.recall != nullptr)   // STRATA_LOOKAHEAD_RECALL: this request's recall (the counter was reset where it started)
+                std::fputs(strata::core::LookaheadRecall::format(recall.take(), recall_level, recall_k_pred).c_str(), stderr);
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 // (this device's owned ordinals; a split's other stages hold theirs)
