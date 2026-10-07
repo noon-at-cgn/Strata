@@ -2565,7 +2565,13 @@ void window_gpu_plan(const WindowGpuPlanInput& in, GpuPlanSink& P, int32_t* kind
         ord_of[i] = o;
     }
     const bool pcie_ok = in.pcie_num > 0 && in.pcie_layer;
-    const int m = pcie_ok ? (nmiss * in.pcie_num) >> 8 : 0;
+    // --pcie-balance: the share minimising max(PCIe copies, CPU pool) from the measured costs, never above --pcie-frac
+    // (ceil) nor the staging slots; otherwise the fixed floor of --pcie-frac
+    const int m = !pcie_ok ? 0
+                : (in.balance != nullptr && in.balance->enabled)
+                    ? in.balance->choose(nmiss, std::min(pcie_balance_cap(nmiss, in.pcie_num),
+                                                         (int) std::min<int64_t>(P.staging_cap, 64)), in.blob_mib)
+                    : (nmiss * in.pcie_num) >> 8;
     int miss_rank = 0, groups = 0, fetches = 0;
     int16_t pcie_ord[64];
     for (int q = 0; q < nd; ++q) {
@@ -2671,7 +2677,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int pcie_fetched = 0;                  // distinct experts this layer's plan reads over PCIe
+    const double blob_mib = (double) lay.blob_bytes(d.layers) / 1048576.0;
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
+
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         detail::WindowGpuPlanInput in;
@@ -2692,8 +2701,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         in.cache_slot_off = d.cache_slot_off;
         in.pcie_experts = &d.pcie_experts;
         const uint64_t bb = lay.blob_bytes(d.layers);
+        in.balance = d.balance;      // --pcie-balance: the plan chooses its PCIe share from the measured costs
+        in.blob_mib = blob_mib;
         detail::window_gpu_plan(in, P, kind, (int64_t) bb, dma_src);
         const int fetches = P.counts[2];
+        pcie_fetched = fetches;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
@@ -2843,6 +2855,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
+    // the pool's time per expert, for --pcie-balance (jobs = the distinct experts the CPU computed); a layer with a
+    // helper GPU or a peer in it also times their finish, so it gives no sample
+    if (d.balance != nullptr && njobs > 0 && d.remote_count == 0 && d.peer == nullptr)
+        d.balance->note_cpu(ms(c3, c4) / ((double) njobs * blob_mib), njobs, pcie_fetched > 0);
     for (int64_t i = 0; i < n_tok * k; ++i) {
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

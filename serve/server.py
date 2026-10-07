@@ -930,6 +930,10 @@ class StrataEngine:
             kp = tune.get("prefill_pipe_k")
             if isinstance(kp, int) and not isinstance(kp, bool) and 1 <= kp <= 16:
                 keys += f" prefill_pipe_k={kp}"
+            # the cost-balanced PCIe share (engine --pcie-balance) on or off for this request: true/false or 1/0
+            pb = tune.get("pcie_balance")
+            if isinstance(pb, bool) or (isinstance(pb, (int, float)) and pb in (0, 1)):
+                keys += f" pcie_balance={int(pb)}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
