@@ -310,3 +310,23 @@ and the aggregate rate.
 With `--vision`, each batch slot keeps its own image-position table on every GPU stage. Later image or text
 admissions cannot change an active reply's positions; slot reuse updates the table without recapturing its graphs.
 The same isolation applies to each slot's drafter with `--batch-mtp`.
+
+Each of those tables is (`--max-context` + 64) cells of three 32-bit integers, 12 bytes a cell (3.0 MiB at 262,144
+cells), one per slot on every stage's GPU: 4 slots on 2 GPUs take about 25 MiB in all. They are allocated with the
+slot sessions, before the expert cache is sized, so the cache gets that much less VRAM; the start-up log says so
+(`--batch N --vision: N per-slot image-position tables ...`). Because a slot's rows no longer share one table, a batch window with
+`--vision` runs the per-head norm and the rope as separate launches (a slot's rows together) instead of the one fused
+launch; this adds a few kernel launches per attention layer to every window of a `--vision` batch.
+
+## Switches to compare with and without a restart
+
+These change only how the host schedules the work, or which equal-result code runs. Each can be set for the whole
+engine at start-up and, through the server's `strata_tune` request field (the same field as `pcie_frac` and
+`spec_min_p`), for the next requests without a restart. With batch slots the value of the most recently started
+request is what the windows use, so compare them with one client at a time, or tag every request the same way.
+A request without the key goes back to the start-up value.
+
+| Switch | Start-up | Per request (`strata_tune`) | What it does | What to look at |
+| --- | --- | --- | --- | --- |
+| AVX2 Q8_K activation quantizer for the CPU experts | on (CPUs with AVX2) | `{"q8k_avx2": 0}` or `1`; `STRATA_NO_Q8K_AVX2=1` starts it off | the same bytes as ggml-cpu's scalar quantizer, computed with AVX2 | the `CPU experts` / pool time of the window lines; output is identical either way |
+| `--batch-overlap` (`STRATA_BATCH_OVERLAP=1`) | off | `{"batch_overlap": 1}` or `0` | each window launches every stage's commit graph before it waits for any, and with `--batch-mtp` launches the slots' draft graphs back to back (each waits for the previous drafter's on the GPU, so they still run one at a time) and collects them together | in `strata batch: ... + commit X + emit Y`, `commit` and `emit` ms per window; the last line of that block says `--batch-overlap ON`. Not measured yet on GPUs. |
