@@ -182,7 +182,7 @@ std::vector<std::string> split(const std::string& s) {
 
 int bench_main(int argc, char** argv) {
     double epl = 3.3;
-    int nt = 1, layers = 2000, mb = 768, gu_rows = 40, down_rows = 160, workers = 0;
+    int nt = 1, layers = 2000, mb = 768, gu_rows = 20, down_rows = 80, workers = 0;
     bool host = true;
     std::vector<std::string> drains = {"barriered", "counters"}, kernels = {"ggml", "fast"};
     for (int i = 1; i < argc; ++i) {

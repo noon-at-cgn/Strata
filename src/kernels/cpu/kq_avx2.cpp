@@ -200,7 +200,11 @@ void q8_0_dot(const block_q8_0* x, int nb, const void* const* act, int nt, float
 //   - the next row set's bytes are prefetched while this one is computed (the rows of an expert are contiguous).
 // Every integer result is exact (no int16 saturation either: the same maddubs/madd as ggml) and the float part keeps
 // ggml's order, so the result of one row does not depend on R, NT or the row range.
-#define KQF_UNROLL _Pragma("GCC unroll 8")
+#if defined(__GNUC__)
+#define KQF_UNROLL _Pragma("GCC unroll 8")   // keeps the R x NT accumulators in registers (GCC does not scalarize them otherwise)
+#else
+#define KQF_UNROLL
+#endif
 constexpr int kFastMaxNt = 4;   // tokens per pass; larger groups run in several passes over the (L1-resident) rows
 
 inline void prefetch_t0(const void* p) { _mm_prefetch((const char*) p, _MM_HINT_T0); }
