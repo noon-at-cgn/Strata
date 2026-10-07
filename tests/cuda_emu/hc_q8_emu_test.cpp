@@ -9,6 +9,8 @@
 //      and without the pending write, with and without the inject rows (BF16 and Q8_0), with the S26 q8_1 image, with R_out
 //      in place and not, and under several block dispatch orders and residency limits (including one block at a time):
 //      the fused read changes the launch structure, not one bit of the result; and the counters are zero afterwards.
+//   E. the same for the BF16 read (gr_hc_fused_kernel, STRATA_HC_FUSED=1 without STRATA_HC_Q8): bit-identical to the staged read's
+//      three launches (gr_norm_split_kernel, gr_down_staged_kernel, gr_up_multi_kernel), and that read to a double reference.
 //   C. a kernel that waits for blocks that cannot start is reported as a deadlock, not hung (the emulator's guard).
 //   D. the ticket is what makes the fused read safe: the same kernel with tasks taken from blockIdx is a deadlock when the up
 //      blocks are dispatched first and the GPU has room for two blocks; the ticketed one finishes.
@@ -32,6 +34,7 @@ namespace strata::kernels {
 namespace {
 #include "fused_gr_common.cuh"
 #include "hc_q8.cuh"
+#include "hc_bf16.cuh"
 
 int failures = 0;
 #define CHECK(cond)                                                                    \
@@ -128,6 +131,65 @@ Out run(const Fixture& f, const Case& c) {
     }
 }
 
+
+// ---- the BF16 read: the staged variant's three launches against the one launch
+struct Bf16Weights { std::vector<uint16_t> down, up; };
+template <int T> Out run_bf16_t(const Fixture& f, const Bf16Weights& w, const Case& c) {
+    std::vector<float> R = f.R;
+    std::vector<float> Rout((size_t) T * D, -7.0f), lo((size_t) T * LR, -7.0f), rs((size_t) T * HC, -7.0f),
+        inj_out((size_t) T * HC, -7.0f), mixed((size_t) T * N, -7.0f), xn((size_t) T * D, 0.0f);
+    std::vector<uint8_t> q81((size_t) T * (N / 32) * 36, 0x5a);
+    std::vector<unsigned> qcnt(N / 32, 0), sync(kFusedGrSyncWords, 0);
+    GrMulti m{};
+    m.T = T;
+    m.xn = xn.data();
+    for (int t = 0; t < T; ++t) {
+        FusedGrArgs& a = m.a[t];
+        a.R = R.data() + (size_t) t * D;
+        a.R_out = c.in_place ? R.data() + (size_t) t * D : Rout.data() + (size_t) t * D;
+        a.apply = c.apply;
+        a.bo_prev = f.bo.data() + (size_t) t * N;
+        a.inj_prev = f.inj_prev.data() + (size_t) t * HC;
+        a.w_norm = f.w_norm.data();
+        a.w_down = w.down.data(); a.w_up = w.up.data();
+        a.w_inject = c.inject ? f.w_inj.data() : nullptr;
+        a.eps = f.eps;
+        a.lo = lo.data() + (size_t) t * LR;
+        a.rs = rs.data() + (size_t) t * HC;
+        a.inject_out = inj_out.data() + (size_t) t * HC;
+        a.mixed = mixed.data() + (size_t) t * N;
+        if (c.qfuse) { a.q8_mixed = q81.data() + (size_t) t * (N / 32) * 36; a.q8_cnt = qcnt.data(); }
+    }
+    const size_t dyn = (size_t) T * 2 * H_TILE * sizeof(float);
+    if (c.kind == Kind::TwoLaunch) {   // the staged variant: three launches
+        emu::LaunchOpts o0;
+        o0.dyn_smem = dyn;
+        emu::launch(emu::dim3(T, HC), emu::dim3(THREADS), [&] { gr_norm_split_kernel(m); });
+        emu::launch(emu::dim3(DOWN_BLOCKS + 1), emu::dim3(THREADS), [&] { gr_down_staged_kernel<T, true>(m); }, o0);
+        emu::launch(emu::dim3(UPM_BLOCKS), emu::dim3(THREADS), [&] { gr_up_multi_kernel<T, true>(m); });
+    } else {
+        m.a[0].hc_sync = sync.data();
+        emu::LaunchOpts o = c.opt;
+        o.dyn_smem = dyn;
+        emu::launch(emu::dim3(kF1Grid<T>), emu::dim3(THREADS), [&] { gr_hc_fused_kernel<T>(m, sync.data()); }, o);
+    }
+    Out o;
+    o.mixed = mixed; o.Rout = c.in_place ? R : Rout; o.rs = rs; o.inject = inj_out; o.lo = lo; o.q81 = q81;
+    if (c.kind == Kind::Fused)
+        for (unsigned v : sync) if (v != 0) o.ok = false;
+    if (c.qfuse)
+        for (unsigned v : qcnt) if (v != 0) o.ok = false;
+    return o;
+}
+Out run_bf16(const Fixture& f, const Bf16Weights& w, const Case& c) {
+    switch (f.T) {
+        case 1: return run_bf16_t<1>(f, w, c);
+        case 2: return run_bf16_t<2>(f, w, c);
+        case 3: return run_bf16_t<3>(f, w, c);
+        default: return run_bf16_t<4>(f, w, c);
+    }
+}
+
 using hcref::same_bits;
 using hcref::worst;
 hcref::Ref reference(const Fixture& f, const Case& c) {
@@ -203,6 +265,47 @@ int main(int argc, char** argv) {
                 const double e = worst(o.lo, r.lo);
                 CHECK(e < 5e-6);
                 if (T == 1 || T == 8) std::printf("B  T=%d lo handed to the up tasks: worst error / max|ref| %.2e\n", T, e);
+            }
+        }
+    }
+
+    // ---- E: the BF16 read, one launch against the staged variant's three ---------------------------------------------
+    for (int T = 1; T <= F1_MAX_T; ++T) {
+        Fixture f;
+        f.build(T, 700u + (unsigned) T);
+        Bf16Weights w{Fixture::bf16_copy(f.dq_down), Fixture::bf16_copy(f.dq_up)};
+        std::vector<float> bd(w.down.size()), bu(w.up.size());
+        for (size_t i = 0; i < bd.size(); ++i) bd[i] = strata::kernels::f32_from_bf16(w.down[i]);
+        for (size_t i = 0; i < bu.size(); ++i) bu[i] = strata::kernels::f32_from_bf16(w.up[i]);
+        struct EV { bool apply, inject, in_place, qfuse; };
+        const EV evs[] = {{true, true, false, false}, {true, true, true, true}, {false, false, false, true}};
+        for (size_t vi = 0; vi < sizeof(evs) / sizeof(evs[0]); ++vi) {
+            if (quick && (T != 3 || vi != 1)) continue;
+            Case base;
+            base.apply = evs[vi].apply; base.inject = evs[vi].inject; base.in_place = evs[vi].in_place; base.qfuse = evs[vi].qfuse;
+            base.kind = Kind::TwoLaunch;
+            const Out ref = run_bf16(f, w, base);
+            if (vi == 0) {   // the staged read against the double reference (BF16 weights as floats)
+                const hcref::Ref r = hcref::reference(f, base.apply, base.inject, false, bd, bu);
+                const double em = worst(ref.mixed, r.mixed), el = worst(ref.lo, r.lo), er = worst(ref.rs, r.rs);
+                std::printf("E  T=%d staged BF16 read vs double reference: mixed %.2e lo %.2e rs %.2e\n", T, em, el, er);
+                CHECK(em < 5e-6); CHECK(el < 5e-6); CHECK(er < 1e-6);
+            }
+            struct Disp { emu::Order order; int resident; };
+            const Disp disps[] = {{emu::Order::Ascending, 12}, {emu::Order::Descending, 4}, {emu::Order::Shuffled, 3}, {emu::Order::Ascending, 1}};
+            for (size_t di = 0; di < sizeof(disps) / sizeof(disps[0]); ++di) {
+                if (di >= 2 && T != 3) continue;
+                Case c = base;
+                c.kind = Kind::Fused;
+                c.opt.order = disps[di].order; c.opt.resident = disps[di].resident; c.opt.seed = 11u + (unsigned) di;
+                const Out o = run_bf16(f, w, c);
+                const bool same = same_bits(o.mixed, ref.mixed) && same_bits(o.Rout, ref.Rout) && same_bits(o.rs, ref.rs) &&
+                                  same_bits(o.lo, ref.lo) && (!base.inject || same_bits(o.inject, ref.inject)) &&
+                                  (!base.qfuse || o.q81 == ref.q81);
+                std::printf("E  T=%d apply=%d inject=%d in_place=%d qfuse=%d order=%d resident=%d: one launch vs three: %s%s  [%.1f s]\n", T,
+                            base.apply, base.inject, base.in_place, base.qfuse, (int) disps[di].order, disps[di].resident,
+                            same ? "bit-identical" : "DIFFERS", o.ok ? "" : " COUNTERS NOT ZERO", secs());
+                CHECK(same); CHECK(o.ok);
             }
         }
     }
