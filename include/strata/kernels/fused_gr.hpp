@@ -45,7 +45,11 @@ struct FusedGrArgs {
     /// bytes native_quantize_q8_1 would write); q8_cnt = n_embd / 32 zeroed counters owned by the caller (token 0's)
     uint8_t* q8_mixed = nullptr;
     unsigned* q8_cnt = nullptr;
+    /// STRATA_HC_Q8_FUSED=1 (the Q8_0 read only, token 0's): kFusedGrSyncWords zeroed counters owned by the caller, one
+    /// set per device and per concurrent launch; the read's single launch leaves them zero.  Null: the two-launch Q8 read.
+    unsigned* hc_sync = nullptr;
 };
+constexpr int kFusedGrSyncWords = 16;
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
 void fused_gr_read(const FusedGrArgs& a, void* stream);
@@ -73,5 +77,12 @@ void fused_gr_set_fast(int on);
 /// plain read unless STRATA_HC_SPLIT=1 or 2 names a variant.
 void fused_gr_check();
 int fused_gr_variant();
+
+/// STRATA_HC_FUSED=1: the read as ONE launch (`hc_sync` set on token 0's args; kFusedGrSyncWords zeroed counters per device
+/// and concurrent launch).  Every output is bit for bit the multi-launch read's - the BF16 read (staged variant), or with
+/// `q8` the Q8_0 read STRATA_HC_Q8 selects.  This runs both on random weights on the current card (1..8 tokens, with and
+/// without the pending write) and says false, printing why, if they differ by one bit or the fused launch does not finish
+/// as it should; the caller then does not set `hc_sync`.  Once per card and form.  Always false off CUDA (no fused read).
+bool fused_gr_fused_check(bool q8);
 
 }  // namespace strata::kernels
