@@ -2822,7 +2822,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
-int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+int Verifier::service(PoolMultiFn pool, void* user, std::string& err, int max_layers) {
     if (!fl_active_) return 1;
     if (fl_k_ >= fl_total_) return 1;
     const OnDevice on_device(device_);
@@ -2848,7 +2848,8 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     }
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    while (fl_k_ < fl_total_) {
+    int served = 0;   // layers served by this call (max_layers caps it: the caller has another window to give turns to)
+    while (fl_k_ < fl_total_ && served < max_layers) {
         const int64_t l = lb_ + fl_k_ / G;
         const uint32_t want = (uint32_t) (fl_k_ + 1);
         if (*(volatile uint32_t*) h_seq_ < want) {
@@ -2901,8 +2902,9 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         ++fl_k_;
         ms_pool += ms_since(b);
         fl_since_ms_ = fl_flush_ms_ = now_ms();
+        ++served;
     }
-    return 1;
+    return fl_k_ >= fl_total_ ? 1 : 0;
 }
 
 bool Verifier::done(std::string& err) {

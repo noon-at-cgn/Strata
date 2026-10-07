@@ -240,8 +240,8 @@ bool refill_blocking() {
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
-// LOOKUP_PON, PRESTAGE, AGREE, SNAP_OVERLAP) is read only with STRATA_PIPELINE_DEBUG=1; without it the defaults apply.
-// (STRATA_PIPELINE_ADAPT_ASYNC=0 is read at start-up without it.)
+// LOOKUP_PON, PRESTAGE, AGREE, SNAP_OVERLAP, PRIO) is read only with STRATA_PIPELINE_DEBUG=1; without it the defaults
+// apply.  (STRATA_PIPELINE_ADAPT_ASYNC=0 is read at start-up without it.)
 static const char* pipe_dbg_env(const char* name) {
     static const bool on = [] { const char* v = std::getenv("STRATA_PIPELINE_DEBUG"); return v != nullptr && v[0] != 0 && v[0] != '0'; }();
     return on ? std::getenv(name) : nullptr;
@@ -10009,7 +10009,9 @@ int main(int argc, char** argv) {
                                   std::chrono::duration<double, std::milli>(Clock::now() - pl_tr0).count(), ev, seq, x0, x1);
                     pl_trace += b;
                 };
-                auto pump0 = [&](PW& w) -> bool {
+                // STRATA_PIPELINE_PRIO=0 (with STRATA_PIPELINE_DEBUG=1): serve stage 0's windows entirely before stage 1's
+                static const bool pl_prio = [] { const char* e = pipe_dbg_env("STRATA_PIPELINE_PRIO"); return e == nullptr || std::atoi(e) != 0; }();
+                auto pump0 = [&](PW& w, int max_layers = std::numeric_limits<int>::max()) -> bool {
                     if (!w.launched || w.finished) return true;
                     strata::core::Verifier& v = V0(w);
                     // a doomed window (its guess was wrong) gets empty plans: no expert work on the CPU or the GPU for
@@ -10017,7 +10019,7 @@ int main(int argc, char** argv) {
                     // undo restores everything it wrote).  STRATA_PIPELINE_DOOM_SKIP=0: served in full.
                     static const bool doom_skip = [] { const char* e = pipe_dbg_env("STRATA_PIPELINE_DOOM_SKIP"); return e == nullptr || std::atoi(e) != 0; }();
                     const bool skip = doom_skip && doomed && &w == &D;
-                    if (v.service(skip ? nullptr : &drive_pool_split, SDf(w), err) < 0) return false;
+                    if (v.service(skip ? nullptr : &drive_pool_split, SDf(w), err, max_layers) < 0) return false;
                     if (v.done(err)) {
                         if (!v.pl_finish(nullptr, err)) return false;
                         w.finished = true;
@@ -10213,16 +10215,26 @@ int main(int argc, char** argv) {
                             if (!adapt_tick(false, false)) return die("an adaptive refill failed");
                         }
                     }
-                    // ---- every window in flight served
-                    if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
-                    if (A.s1 && !A.s1_done) {
+                    // ---- every window in flight served.  The pool is one serial resource both stages wait on: the verified
+                    // window on stage 1 is the one the verdict (and so the next fresh window) waits for, so its layers are
+                    // served first and each stage 0 window gets one layer per turn.  STRATA_PIPELINE_PRIO=0: stage 0's
+                    // windows entirely first, as before.
+                    auto serve1 = [&]() -> bool {
+                        if (!A.s1 || A.s1_done) return true;
                         strata::core::Verifier& v = V1(A);
-                        if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
+                        if (v.service(&drive_pool_split, SDf(A), err) < 0) return false;
                         if (v.done(err)) {
-                            if (!v.pl_finish(outp.data(), err)) return die(err);
+                            if (!v.pl_finish(outp.data(), err)) return false;
                             A.s1_done = true;
                             tre("F1", A.seq, A.T);
-                        } else if (!err.empty()) return die(err);
+                        } else if (!err.empty()) return false;
+                        return true;
+                    };
+                    if (pl_prio) {
+                        if (!serve1()) return die(err);
+                        if ((doomed && !pump0(D)) || !pump0(A, 1) || !pump0(B, 1)) return die(err);
+                    } else {
+                        if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B) || !serve1()) return die(err);
                     }
                     if (drive.d.failed) return die(drive.d.fail ? drive.d.fail : "the expert pool failed");
                     // ---- a wrong speculative window has finished: stage 0 back to the verified window's real commit
