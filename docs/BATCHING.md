@@ -125,10 +125,25 @@ chunks its conversation has reached.
   2048-8192 tokens) they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so
   a long prompt slows the others down instead of stopping them. The chunks are the ones one uninterrupted read
   takes, so the prompt's arithmetic is unchanged.
-- **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with a prompt under
-  half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
-  so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
-  same chunks (at most twice per request).
+- **A long prompt gives way to a short one** (#656's cooperative preemption): when a request with under half as
+  much left to read as the long read has is waiting, the server sends `BYIELD`; at its next part boundary the long
+  read stops, the part read so far is copied into a slot, the short request is admitted, and the long one then goes
+  on from its slot with the same chunks (at most twice per request). What is left to read is the prompt less the
+  start the engine already holds for it (a slot's conversation, or an earlier read's prompt up to its last turn
+  token while a slot or the conversation cache still holds it), not the prompt's length: a follow-up turn whose
+  history is held counts only its new tokens (#1288). The long read gives way only while the waiting request gets
+  a slot at once.
+- **Chunks per part** (`STRATA_PREFILL_PIPE_K`, default 1; per request `strata_tune: {"prefill_pipe_k": N}`, whole
+  numbers 1-16). With a layer split, the two stages overlap their chunks only inside one prompt run, so a read
+  that goes one chunk at a time between the slots' windows runs the stages one after the other. With
+  `prefill_pipe_k = k` a part is k chunks in one run (about k + 1 stage times instead of 2k), then the slots
+  decode. The chunks, their positions and their arithmetic are the same as with 1; what moves is where the slots
+  get their turn: every k chunks, so a slot waits k times longer for it (and a `BYIELD` is taken at the next part
+  boundary, up to k chunks later). The slots' decode share is scaled so that their decode time per prompt token
+  stays what 1 gives, assuming the two stages take equally long (it is `STRATA_BATCH_DECODE_SHARE` x 2k/(k+1) of
+  the part's time). Only a layer split with slots decoding is affected; without one the knob is ignored. To
+  compare values, read the engine log's `the prompt was read in N parts, the slots decoding X ms between them`
+  line (it names the chunks a part holds), the time the read takes, and the slots' tok/s.
 - **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the
   checkpoint at the prompt's last turn boundary); the next turn of that conversation goes to that slot and the
   engine copies its state back (50-60 ms for a short conversation) instead of reading the history again - also for
