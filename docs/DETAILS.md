@@ -773,11 +773,66 @@ actually share. When the session gives its conversation up - it moved into a bat
 instead of waiting to be mistaken for another conversation's.
 
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
-physical-RAM headroom remain available: the engine checks before allocation and
-again after capture. Unknown telemetry or insufficient RAM skips parking. Windows
-uses `GlobalMemoryStatusEx`, Linux uses `MemAvailable`; these are host-level samples,
-not a reservation or enforcement of container/job memory limits. An 8 GiB budget
+RAM headroom remain available: the engine checks before allocation (against the
+snapshot's estimated size, less the K/V it already retains) and again after capture.
+Unknown telemetry or insufficient RAM skips parking, and the same figure and floor
+decide whether a session file may be saved or restored (below). An 8 GiB budget
 is a cap, not a recommendation for every machine.
+
+**The RAM figure (`available_host_bytes()`).** The headroom is the smallest of three
+numbers, sampled each time it is asked and not a reservation (other writers can take the
+room afterwards):
+
+1. `MemAvailable` (Windows: `GlobalMemoryStatusEx`'s available physical memory).
+2. The room under each memory limit of the engine's own cgroup and of every ancestor
+   visible under `/sys/fs/cgroup` (the group named in `/proc/self/cgroup`, or the deepest
+   part of that path this mount shows): cgroup v2 `memory.max` and `memory.high`, each
+   minus `memory.current`; cgroup v1 `memory.limit_in_bytes` minus
+   `memory.usage_in_bytes`. `max` and v1's "unlimited" count as no limit; a file that is
+   absent (no memory controller at that level) is skipped; a file that is there but
+   cannot be read or parsed makes the sample unknown, and unknown skips parking.
+3. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, `0` = none):
+   N MiB is the total this engine's container or cgroup may use, minus what that
+   container uses now. Use it when the container cannot see its own limit. The usage
+   is `memory.current` of the top cgroup this mount shows (the container's own, in a
+   container with its own cgroup namespace); if that file cannot be read it is
+   `MemTotal - MemAvailable`, which is a weaker figure (it is only as true as the
+   container's `/proc/meminfo`), and if `MemTotal` is missing too the sample is
+   unknown. The cap is taken in addition to 1 and 2, never instead of them: whichever
+   number is smallest decides. It is an engine argument, so the server config carries it in
+   `args` (`"--memory-limit-mib", "102400"`); the variable also works from the config's
+   `"env"`.
+
+Usage is `memory.current` as the kernel reports it, **page cache included**. The kernel
+could reclaim some of that cache before it kills anything, so the figure can read low
+on a machine that has a lot of clean cache; it is not corrected for it, because
+pinned, locked and shared memory is charged to `memory.current` as well and cannot be
+given back, and a kill at a hard limit is worse than a skipped park. A parked
+conversation is part of the engine's own usage once captured; the check before
+capture is what stops it from growing past the cap.
+
+The startup log has one line for it, `strata generate: memory guard: limit X GiB
+(source: flag|cgroup|meminfo), current Y GiB; available ... `, where `source` names the
+number that was smallest at that moment (`meminfo`: MemTotal and `MemTotal -
+MemAvailable`), and a skipped park or a refused save/restore says how much it had and
+from which source. Without a cgroup limit and without `--memory-limit-mib` the figure is
+plain `MemAvailable`, as before. Unrelated to this figure: the startup sizing of the
+expert arena, the file tier's resident budget and the Windows commit check keep their
+own probes (`--resident-budget-gib`, #633).
+
+Measured on a Proxmox LXC where the engine's container cannot see its limit: the cap
+is 100 GiB on the parent cgroup (outside the container's namespace), the container's
+own `memory.max` and `memory.high` read `max`, `/proc/meminfo` shows about 120 GiB
+`MemTotal` and about 25 GiB `MemAvailable` while the real headroom is about 1 GiB, and
+`/sys/fs/cgroup/memory.current` inside the container tracks the host's own figure
+(99.7 GiB there when the host showed 98.8). In one read of that container, most of
+`memory.current` (97.1 GiB) was pinned or shared memory (65.5 GiB `Shmem`, 26.8 GiB
+`Mlocked`, 13 MB of inactive file cache), so a cache credit would have changed little.
+There `--memory-limit-mib 102400` is the cap, and the floor
+(`--conversation-cache-min-free-mib`) is measured against what is left under it: with
+the engine already near the cap, a floor of several GiB refuses every park; a few
+hundred MiB keeps a margin for the allocator and the kernel while letting a snapshot
+that really fits go through.
 
 The shared snapshot core validates all layers and checkpoints before applying any
 state. Invalid entries are discarded; transfer/synchronization failure is fatal
