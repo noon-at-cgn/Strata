@@ -154,6 +154,12 @@ public:
     /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
     /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
     bool commit_slot_prefixes(const int* keep, std::string& err);
+    /// --batch-overlap (default off; STRATA_BATCH_OVERLAP=1 starts it on; any thread may flip it between windows):
+    /// commit_slot_prefixes launches every stage's commit graph first and syncs them together, and the engine's batch
+    /// loop launches the slot drafters back to back and collects them afterwards.  The same work and results, fewer
+    /// host waits in a window.
+    static void set_batch_overlap(bool on);
+    static bool batch_overlap();
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
 
@@ -265,6 +271,9 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
+    bool commit_prefix_launch(const int* keep, std::string& err);   ///< commit_slot_prefixes' host setup and graph launch
+    bool commit_prefix_finish(const int* keep, std::string& err);   ///< ... its sync, then the PLE history
+    std::chrono::steady_clock::time_point commit_t0_{};
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;

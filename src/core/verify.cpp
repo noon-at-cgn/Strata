@@ -2478,11 +2478,40 @@ bool Verifier::commit_slots(std::string& err) {
     return commit_slot_prefixes(keep.data(), err);
 }
 
+namespace {
+// --batch-overlap: see Verifier::set_batch_overlap
+std::atomic<bool> g_batch_overlap{env_on("STRATA_BATCH_OVERLAP")};
+}  // namespace
+void Verifier::set_batch_overlap(bool on) { g_batch_overlap.store(on, std::memory_order_relaxed); }
+bool Verifier::batch_overlap() { return g_batch_overlap.load(std::memory_order_relaxed); }
+
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+    if (!batch_overlap()) {   // each stage in turn: launch, sync, then the next stage
+        if (!commit_prefix_launch(keep, err) || !commit_prefix_finish(keep, err)) return false;
+        return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
+    }
+    // Every stage's graph launched first (each is on its own GPU, with its own host buffers and its own slots' state, so
+    // none reads what another writes), then each one synced.  A stage that failed to launch ends the launching; the
+    // graphs already in flight are still waited for, so nothing is left running behind the error.
+    int launched = 0;
+    bool ok = true;
+    for (Verifier* v = this; v != nullptr; v = v->next_) {
+        if (!v->commit_prefix_launch(keep, err)) { ok = false; break; }
+        ++launched;
+    }
+    Verifier* v = this;
+    for (int i = 0; i < launched; ++i, v = v->next_) {
+        std::string e2;
+        if (!v->commit_prefix_finish(keep, e2) && ok) { ok = false; err = e2; }
+    }
+    return ok;
+}
+
+bool Verifier::commit_prefix_launch(const int* keep, std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
     const int S = last_t_;
-    const Clock::time_point t0 = Clock::now();
+    commit_t0_ = Clock::now();
     const int64_t CB = 2 + max_t_;
     // One prefix per slot: rejected draft rows must not enter recurrent state.
     for (int t = 0; t < S;) {
@@ -2502,6 +2531,12 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+    return true;
+}
+
+bool Verifier::commit_prefix_finish(const int* keep, std::string& err) {
+    const OnDevice on_device(device_);
+    const int S = last_t_;
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
     if (ple_stage())
@@ -2514,8 +2549,8 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
                 sx.ple_prev[1] = last_tokens_[u];
             }
         }
-    ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
+    ms_commit += ms_since(commit_t0_);
+    return true;
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
