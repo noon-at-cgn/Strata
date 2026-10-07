@@ -507,6 +507,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_window_plan_test COMMAND expert_window_plan_test)
     set_tests_properties(expert_window_plan_test PROPERTIES TIMEOUT 60)
   endif()
+  # the verify window's PCIe-share variants: which graph, flag B's wait, the batch graph keys (header-only, CPU only)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/verify_variant_test.cpp")
+    add_executable(verify_variant_test tests/core/verify_variant_test.cpp)
+    target_include_directories(verify_variant_test PRIVATE include)
+    add_test(NAME verify_variant_test COMMAND verify_variant_test)
+    set_tests_properties(verify_variant_test PROPERTIES TIMEOUT 60)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions

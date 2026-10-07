@@ -261,6 +261,10 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// The window's graph was captured without a PCIe share (`verify_variant.hpp`): the plan must read nothing over
+    /// PCIe, whatever `pcie_num` or the balance say - a PCIe group planned for such a graph would be computed by
+    /// nobody.  Set by the Verifier at each window's launch.
+    bool no_pcie = false;
 };
 
 namespace detail {

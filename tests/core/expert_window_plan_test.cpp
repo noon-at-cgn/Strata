@@ -238,7 +238,7 @@ uint64_t rnd() {
 bool run_case(const char* name, int64_t n_tok, int64_t k, int64_t n_expert, double resident_frac,
               double pinned_frac, bool with_peer, bool with_helper, int pcie_num, bool pcie_layer,
               int64_t staging_cap, int pcie_mode, bool slot_off, double dup_frac, bool invalid_ids,
-              const PcieBalance* bal0 = nullptr) {
+              const PcieBalance* bal0 = nullptr, bool no_pcie = false) {
     const int64_t n = n_tok * k;
     Stub stub;
     stub.n_expert = n_expert;
@@ -286,12 +286,29 @@ bool run_case(const char* name, int64_t n_tok, int64_t k, int64_t n_expert, doub
     WindowGpuPlanInput in_b = in;
     in_b.pcie_experts = &pcie_b;
     PcieBalance bal_a, bal_b;   // identical copies: the choice has state (the exploration counter), so each planner gets its own
+    const int64_t bal0_moved = bal0 != nullptr ? bal0->moved : 0, bal0_layers = bal0 != nullptr ? bal0->layers : 0;
     const double blob_mib = (double) stub.blob_bytes / 1048576.0;
     if (bal0 != nullptr) {
         bal_a = *bal0;
         bal_b = *bal0;
         in.balance = &bal_a;
         in.blob_mib = blob_mib;
+    }
+    if (no_pcie) {
+        // the verifier's no-PCIe window variant: the sink's flag must plan exactly what a share of 0 plans, whatever the
+        // share asked for and the balance would choose (a PCIe group in such a graph would be computed by nobody)
+        A.P.no_pcie = true;
+        in_b.pcie_num = 0;
+        in_b.balance = nullptr;
+        window_gpu_plan(in, A.P, kind_a, stub.blob_bytes, dma_a);
+        window_gpu_plan(in_b, B.P, kind_b, stub.blob_bytes, dma_b);
+        std::string why0;
+        const bool same0 = same_plan(A.P, B.P, kind_a, kind_b, dma_a, dma_b, n, why0) && pcie_a == pcie_b;
+        bool no_pcie_kind = A.P.counts[2] == 0;
+        for (int64_t i = 0; i < n; ++i) no_pcie_kind = no_pcie_kind && kind_a[i] != 1;
+        check(same0 && no_pcie_kind && pcie_a == 0 && bal_a.moved == bal0_moved && bal_a.layers == bal0_layers,
+              std::string(name) + (same0 ? "" : " (first difference: " + why0 + ")"));
+        return same0 && no_pcie_kind;
     }
     window_gpu_plan(in, A.P, kind_a, stub.blob_bytes, dma_a);
     reference_plan(in_b, B.P, kind_b, stub.blob_bytes, dma_b, bal0 != nullptr ? &bal_b : nullptr, blob_mib);
@@ -417,6 +434,27 @@ int main() {
                                                    std::to_string(fetched_bal) + " of " + std::to_string(nmiss) + ")");
         check(fetched_bal < fetched_floor, "fewer PCIe copies than the floor rule when the pool is cheaper (" +
                                                std::to_string(fetched_bal) + " < " + std::to_string(fetched_floor) + ")");
+    }
+    // the no-PCIe window variant: the sink's no_pcie flag plans what a share of 0 plans, on the same windows the planner
+    // is compared on above (cold and warmed balances included: a balance never gets to choose, nor is it counted)
+    {
+        int ran_np = 0;
+        for (int pcie_mode = 0; pcie_mode < 3; ++pcie_mode)
+            run_case("no_pcie: every miss pinned, full share asked", 8, 10, 512, 0.0, 1.0, false, false, 255, true, 64,
+                     pcie_mode, false, 0.0, false, nullptr, true), ++ran_np;
+        for (int t = 0; t < 3000; ++t) {
+            const int64_t n_tok = 1 + (int64_t) (rnd() % 8);
+            const int64_t k = 1 + (int64_t) (rnd() % 10);
+            const int64_t n_expert = 1 + (int64_t) (rnd() % 512);
+            PcieBalance b = warmed_balance(0.01 + (rnd() % 100) / 1000.0, 0.03 + (rnd() % 170) / 1000.0, (rnd() & 1) != 0);
+            const bool with_bal = (rnd() & 1) != 0;
+            run_case("no_pcie: randomized window", n_tok, k, n_expert, (rnd() % 1001) / 1000.0, (rnd() % 1001) / 1000.0,
+                     (rnd() & 1) != 0, (rnd() & 1) != 0, (int) (rnd() % 257), (rnd() & 1) != 0, (int64_t) (rnd() % 65),
+                     (int) (rnd() % 3), (rnd() & 1) != 0, (rnd() % 1001) / 1000.0, (rnd() % 4) == 0,
+                     with_bal ? &b : nullptr, true);
+            ++ran_np;
+        }
+        ran += ran_np;
     }
     std::printf("  %d cases\n", ran);
     if (g_fail != 0) {
