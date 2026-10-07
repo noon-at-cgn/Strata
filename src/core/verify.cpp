@@ -1087,10 +1087,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         if (native_rope_enabled()) native_rope_apply(x, x, nr, cols, (int) s.n_rot, rope_scaling(), p, cs);
                         else rope_neox_apply(x, x, nr, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, p, cs);
                     };
+                    // rows of one slot are adjacent and share its position table: one rope launch per run of them
                     const int heads = rows / count;
-                    for (int t = 0; t < count; ++t) {
-                        MropeScope positions(slot_ss(first + t).mrope);
-                        rotate(data + (size_t) t * heads * cols, heads, pos + t * heads);
+                    for (int t = 0; t < count;) {
+                        const int32_t* const table = slot_ss(first + t).mrope;
+                        int u = t + 1;
+                        while (u < count && slot_ss(first + u).mrope == table) ++u;
+                        MropeScope positions(table);
+                        rotate(data + (size_t) t * heads * cols, (u - t) * heads, pos + t * heads);
+                        t = u;
                     }
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
