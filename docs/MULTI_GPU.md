@@ -241,6 +241,10 @@ Two cards, exactly two stages, `--serve`. In the config:
   answer truncated).
 - **Per request**: `strata_tune {"pipeline_windows": 0}` decodes that request serially and `2` pipelined (only if the
   engine was started with `--pipeline-windows 2`); a request without the key goes back to the start-up setting.
+- **Which stage the CPU pool serves first**: both stages wait on the same CPU pool. The loop serves the layers of the
+  verified window on the last card first (the verdict, and so the next unguessed window, waits for them) and gives
+  each guessed window on the first card one layer per turn. `STRATA_PIPELINE_PRIO=0` (read with
+  `STRATA_PIPELINE_DEBUG=1`) serves the first card's windows entirely first, as before, for an A/B.
 - **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
   advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
   no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM

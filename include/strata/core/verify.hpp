@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <limits>
 #include <chrono>
 #include <map>
 #include <cstdint>
@@ -218,8 +219,9 @@ public:
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
     /// `ss.ple_prev` equal to `ple_prev` by then) skips the staging; anything else stages again.
     bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
-    /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
-    int service(PoolMultiFn pool, void* user, std::string& err);
+    /// 1: every layer served; 0: the GPU has not reached the next layer yet, or `max_layers` layers were served this
+    /// call (the caller has another window to give a turn to); -1: an error (`err`).
+    int service(PoolMultiFn pool, void* user, std::string& err, int max_layers = std::numeric_limits<int>::max());
     bool in_flight() const { return fl_active_; }
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
