@@ -61,16 +61,15 @@ const uint8_t* stub_device_alias(void* ctx, int32_t e) {
 
 // A sink with host arrays, sized for the largest window.
 struct Sink {
-    int32_t counts[3];
-    int32_t start[kMaxN + 1];
-    int32_t start2[kMaxN + 1];
-    int32_t dst[kMaxN];
-    int32_t tok[kMaxN];
-    unsigned long long ptr[kMaxN];
-    unsigned long long ptr2[kMaxN];
+    int32_t counts[3] = {};
+    int32_t start[kMaxN + 1] = {};
+    int32_t start2[kMaxN + 1] = {};
+    int32_t dst[kMaxN] = {};
+    int32_t tok[kMaxN] = {};
+    unsigned long long ptr[kMaxN] = {};
+    unsigned long long ptr2[kMaxN] = {};
     GpuPlanSink P;
     Sink(int64_t cap, int64_t staging_cap, int pcie_mode, unsigned long long staging) {
-        std::memset(this, 0, sizeof(*this) - sizeof(P));
         P.counts = counts;
         P.start = start;
         P.dst = dst;
