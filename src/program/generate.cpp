@@ -11892,7 +11892,7 @@ int main(int argc, char** argv) {
                         (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down + pool.ms_counter_layer),
                         (drive.cpu_ms - pool_ms0) / rounds);
         if (rounds > 0 && pool.counter_layers > 0)
-            std::printf("%-24s %lld layers by per-expert counters: %.3f ms/layer (the host waited %.3f ms/layer for the flag after its share)\n",
+            std::printf("%-24s %lld layers by per-expert counters: %.3f ms/layer (%.3f ms/layer from the host's own share done to the last worker out)\n",
                         "pool counters", (long long) pool.counter_layers, pool.ms_counter_layer / (double) pool.counter_layers,
                         pool.ms_counter_tail / (double) pool.counter_layers);
         if (rounds > 0)
