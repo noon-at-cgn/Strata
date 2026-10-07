@@ -36,6 +36,8 @@
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/platform/aux_cpus.hpp"
+#include "strata/core/lookahead_recall.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -418,6 +420,8 @@ struct Options {
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
     /// --host-core first|last (STRATA_HOST_CORE): the host thread's core (see HostCore in pool.hpp)
     std::string host_core;
+    /// --aux-cpus off|auto|LIST (STRATA_AUX_CPUS): where the non-pool, non-host threads run (strata/platform/aux_cpus.hpp)
+    std::string aux_cpus;
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
@@ -868,6 +872,13 @@ void usage() {
                  "                       interrupts to one logical processor, usually the first, and every copy that lands\n"
                  "                       raises one: a spinning host there waits for them.  Moves threads only, never a\n"
                  "                       result.  Not on hybrid CPUs (STRATA_HOST_CORE sets it too).\n"
+                 "  --aux-cpus SET       Where the threads that are neither pool workers nor the host thread run (the\n"
+                 "                       adaptive tier's job thread, the prefill helpers, the CUDA driver's threads, ...):\n"
+                 "                       off (the default: wherever they were created), auto (the SMT siblings of the host's\n"
+                 "                       core, then physical cores with no worker; never a CPU that shares a core with a\n"
+                 "                       worker; nothing is done when none is spare) or a CPU list such as 24,26 (Linux; the\n"
+                 "                       host's and the workers' CPUs are dropped from it).  Moves threads only, never a\n"
+                 "                       result.  STRATA_AUX_CPUS sets it too; a request's strata_tune aux_cpus=0|1 beats it.\n"
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
@@ -1304,10 +1315,13 @@ private:
     }
     void loop() {
         // the job's memcpys stay off the host's core and the pool's: by default the spare SMT sibling of the last
-        // two-thread core (Windows); STRATA_ADAPT_JOB_CPU=<logical cpu>, or -1 for no pinning
+        // two-thread core (Windows); STRATA_ADAPT_JOB_CPU=<logical cpu>, or -1 for no pinning.  Without either, --aux-cpus
+        // (off by default) puts the thread on the spare CPUs; an explicit STRATA_ADAPT_JOB_CPU is the user's word over it.
         const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
         const int cpu = c != nullptr ? std::atoi(c) : smt_spare_cpu();
         if (cpu >= 0) (void) strata::kernels::cpu::pin_current_thread(cpu);
+        if (c != nullptr) strata::aux_cpus::note_owned_thread();
+        else if (cpu < 0) strata::aux_cpus::pin_current_thread();
         for (;;) {
             std::function<void()> f;
             {
@@ -1689,6 +1703,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--aux-cpus") {
+            o.aux_cpus = next("--aux-cpus");
+            std::string aerr;
+            strata::aux_cpus::Config acfg;
+            if (!strata::aux_cpus::parse_spec(o.aux_cpus, acfg, aerr)) {
+                std::fprintf(stderr, "strata generate: %s\n", aerr.c_str());
+                return 2;
+            }
+        }
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
             if (v == "auto") o.pool_affinity = strata::kernels::cpu::PoolAffinity::Auto;
@@ -1919,6 +1942,17 @@ int main(int argc, char** argv) {
         if (hc.empty())
             if (const char* e = std::getenv("STRATA_HOST_CORE")) hc = e;
         if (hc == "last") strata::kernels::cpu::set_host_core(strata::kernels::cpu::HostCore::Last);
+    }
+    {   // --aux-cpus / STRATA_AUX_CPUS: read the CPUs this process may use now, before any thread is pinned; the plan
+        // follows once the pool exists (it needs the workers' CPUs)
+        std::string ac = o.aux_cpus;
+        if (ac.empty())
+            if (const char* e = std::getenv("STRATA_AUX_CPUS")) ac = e;
+        std::string aerr;
+        if (!strata::aux_cpus::configure(ac, aerr)) {
+            std::fprintf(stderr, "strata generate: STRATA_AUX_CPUS: %s\n", aerr.c_str());
+            return 2;
+        }
     }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
@@ -3982,6 +4016,12 @@ int main(int argc, char** argv) {
                              "(--host-core %s)\n", pool.workers(), on.c_str(), ht.host_core,
                      pool.host_works() ? " (draining too)" : "",
                      strata::kernels::cpu::host_core_setting() == strata::kernels::cpu::HostCore::Last ? "last" : "first");
+        // --aux-cpus: the plan, now the workers' CPUs are known; the threads that exist already (the CUDA driver's) move
+        // now when it is on, the ones created later pin themselves (strata/platform/aux_cpus.hpp)
+        const size_t nw = std::min<size_t>((size_t) pool.workers(), ht.worker_cores.size());
+        std::fprintf(stderr, "%s\n",
+                     strata::aux_cpus::set_topology(ht.host_core, std::vector<int>(ht.worker_cores.begin(),
+                                                                                   ht.worker_cores.begin() + (long) nw)).c_str());
     }
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
@@ -4294,7 +4334,7 @@ int main(int argc, char** argv) {
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
                 else read_batch(i);
-                if (i + 64 < want) ahead = std::async(std::launch::async, read_batch, i + 64);
+                if (i + 64 < want) ahead = std::async(std::launch::async, [&read_batch](int64_t b) { strata::aux_cpus::pin_current_thread(); read_batch(b); }, i + 64);
             }
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
@@ -4553,6 +4593,13 @@ int main(int argc, char** argv) {
             err.clear();
         }
     }
+    // STRATA_LOOKAHEAD_RECALL=1|2 (off by default; a measurement, no prefetch, no change to any output): how often the
+    // routers of layers l+1 and l+2, applied to layer l's MoE input, name the experts those layers then route to - and,
+    // of the experts that were not in the GPU cache, how many.  Started below once every stage's weights exist; 2 adds
+    // the recall per layer.  STRATA_LOOKAHEAD_RECALL_K: the experts predicted per token (default: the routed count).
+    const int recall_level = [] { const char* v = std::getenv("STRATA_LOOKAHEAD_RECALL"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+    strata::core::LookaheadRecall recall;
+    int recall_k_pred = 10;   // the experts predicted per token, once the counter runs
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
@@ -6325,6 +6372,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
+                    if (recall_level > 0) ver_same.set_always_publish(true);
                     ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
@@ -6336,6 +6384,7 @@ int main(int argc, char** argv) {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
+                    if (recall_level > 0) gs.ver.set_always_publish(true);
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
@@ -6406,6 +6455,7 @@ int main(int argc, char** argv) {
             pl_pinned_extra += strata::core::Verifier::mapped_bytes() - pin_before;
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
+        if (recall_level > 0) ver.set_always_publish(true);   // the lookahead recall needs every layer's x rows (see Verifier::set_always_publish)
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -6416,6 +6466,37 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        if (recall_level > 0) {   // STRATA_LOOKAHEAD_RECALL: the host copies of every layer's router, whichever stage holds it
+            std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+            bool ok = !pipe;
+            std::string why = pipe ? "it needs serial windows (--pipeline-windows 0)" : "";
+            for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+                const std::string name = "blk." + std::to_string(l) + ".ffn_gate_inp.weight";
+                const strata::core::WeightRef* w = wt.find(name);
+                for (size_t s = 0; w == nullptr && s < stages.size(); ++s) w = stages[s]->wt.find(name);
+                ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                     w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+                if (!ok) { why = "layer " + std::to_string(l) + "'s router is not BF16 in an arena"; break; }
+                routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+                ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (!ok) why = "copying layer " + std::to_string(l) + "'s router";
+            }
+            const char* kv = std::getenv("STRATA_LOOKAHEAD_RECALL_K");
+            const int k_pred = kv != nullptr && std::atoi(kv) > 0 ? std::atoi(kv) : (int) K;
+            // one window in N is scored (default 3): the two router dots cost its thread ~1 ms a layer, a window is ~28 ms
+            const char* ev = std::getenv("STRATA_LOOKAHEAD_RECALL_EVERY");
+            const int every = ev != nullptr && std::atoi(ev) > 0 ? std::atoi(ev) : 3;
+            if (ok && recall.start(std::move(routers), g.n_embd, g.n_expert, k_pred, why, every)) {
+                drive.d.recall = &recall;
+                recall_k_pred = k_pred;
+                std::fprintf(stderr, "strata generate: STRATA_LOOKAHEAD_RECALL=%d: measuring the router lookahead's recall (top-%d of "
+                                     "layers l+1, l+2 from layer l's input, one window in %d; no prefetch, outputs unchanged; every "
+                                     "layer publishes its rows to the host)\n", recall_level, k_pred, every);
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata generate: STRATA_LOOKAHEAD_RECALL: off (%s)\n", why.c_str());
+            }
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -7564,6 +7645,7 @@ int main(int argc, char** argv) {
         std::deque<std::string> in_lines;
         bool in_eof = false;
         std::thread([&] {
+            strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
@@ -7690,6 +7772,7 @@ int main(int argc, char** argv) {
             const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
             if (limit > 0)
                 std::thread([limit] {
+                    strata::aux_cpus::pin_current_thread();
                     strata::core::Progress& p = strata::core::progress();
                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
@@ -7883,6 +7966,7 @@ int main(int argc, char** argv) {
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
         std::vector<double> bt_stage_wait0, bt_stage_pool0;
+        std::vector<strata::core::DoorLatency> bt_door0;   // the doorbell histograms when the burst started
         int64_t bt_cpu_ent0 = 0, bt_off_ent0 = 0;
         // the adaptive VRAM tier in batch windows: windows seen since the engine started (--adapt-every counts them), and,
         // since the last timing line, its rounds, the experts it swapped in and the ms a window waited for it
@@ -8175,6 +8259,9 @@ int main(int argc, char** argv) {
                     bt_stage_wait0[k] = stage_verifier((int) k).ms_wait;
                     bt_stage_pool0[k] = stage_verifier((int) k).ms_pool;
                 }
+                bt_door0.clear();
+                for (size_t k = 0; k <= stages.size(); ++k) bt_door0.push_back(stage_verifier((int) k).door_lat);
+                if (drive.d.recall != nullptr) recall.reset();   // a burst's windows only
                 bt_cpu_ent0 = drive.d.multi_entries; bt_off_ent0 = drive.d.offload_entries;
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
@@ -8196,7 +8283,7 @@ int main(int argc, char** argv) {
                 ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
             } adapt_run;
             if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
-                adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
+                adapt_run.th = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_run.ok = adapt(); });
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             std::vector<int> keep(bs.size(), 0);
             for (int a = 0; a < A; ++a) {
@@ -8366,6 +8453,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: --batch-overlap %s (the commits of all stages launched before one sync%s)\n",
                              strata::core::Verifier::batch_overlap() ? "ON" : "off",
                              batch_mtp ? ", the slot drafts launched back to back" : "");
+                if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
+                    for (size_t k = 0; k <= stages.size() && k < bt_door0.size(); ++k)   // doorbell -> flag A, this burst's layers
+                        std::fprintf(stderr, "strata batch: stage %zu doorbell -> flag A: %s\n", k + 1,
+                                     strata::core::DoorLatency::describe(stage_verifier((int) k).door_lat.since(bt_door0[k])).c_str());
+                if (drive.d.recall != nullptr)   // STRATA_LOOKAHEAD_RECALL: the recall over this burst's windows
+                    std::fputs(strata::core::LookaheadRecall::format(recall.take(), recall_level, recall_k_pred).c_str(), stderr);
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
@@ -8813,6 +8906,7 @@ int main(int argc, char** argv) {
             int req_pipe_k = 0;
             int req_pipeline_windows = -1;   // pipeline_windows=0|2: --pipeline-windows for this request (-1 = the start-up value)
             int req_pcie_balance = -1;   // pcie_balance=0|1: the cost-balanced PCIe share for this request (-1: --pcie-balance)
+            int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8843,6 +8937,7 @@ int main(int argc, char** argv) {
                     else if (key == "batch_overlap") req_batch_overlap = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "pipeline_windows") req_pipeline_windows = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 2);
                     else if (key == "prefill_pipe_k") req_pipe_k = std::max(std::atoi(tok.c_str() + eq + 1), 0);
+                    else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9710,6 +9805,19 @@ int main(int argc, char** argv) {
                 static const bool overlap_start = strata::core::Verifier::batch_overlap();
                 strata::core::Verifier::set_batch_overlap(req_batch_overlap < 0 ? overlap_start : req_batch_overlap != 0);
             }
+            {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
+                // threads only.  An enabled placement is swept at every request: it catches threads created since.
+                static const bool aux_start = strata::aux_cpus::enabled();
+                const bool was_on = strata::aux_cpus::enabled();
+                const bool want = req_aux_cpus < 0 ? aux_start : req_aux_cpus != 0;
+                strata::aux_cpus::set_enabled(want);
+                if (want != was_on)
+                    std::fprintf(stderr, "strata serve: aux cpus %s for this request%s\n", strata::aux_cpus::enabled() ? "ON" : "off",
+                                 want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
+            }
+            std::vector<strata::core::DoorLatency> door0;   // the doorbell histograms at this request's start (STRATA_SPLIT_TIMING)
+            for (int st = 0; st < n_stages; ++st) door0.push_back(stage_ver(st).door_lat);
+            if (o.batch == 0 && drive.d.recall != nullptr) recall.reset();   // lookahead recall: this request's counts only
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // --pcie-balance (flag, env or this request's key): per stage, the link's DMA cost is measured between
             // windows (here, now, when it has never been or the last reading is over a minute old) and the pool's
@@ -10146,7 +10254,7 @@ int main(int argc, char** argv) {
                     if (!drive.d.usage.empty() && o.adapt_every > 0 && (rounds % o.adapt_every) == 0 && pending.empty() &&
                         !exch_wait) {
                         pl_adapt_done = false;
-                        pl_adapt_thr = std::thread([&] { pl_adapt_ok = adapt(); pl_adapt_done = true; });
+                        pl_adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); pl_adapt_ok = adapt(); pl_adapt_done = true; });
                     }
                     return true;
                 };
@@ -10652,7 +10760,7 @@ int main(int argc, char** argv) {
                 bool adapt_ok = true;
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                    adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -11019,7 +11127,13 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: stage %d: %lld windows; per window: wait for the GPU %.3f ms, "
                                          "pool + plan %.3f ms, host staging %.3f ms, commit %.3f ms\n", st,
                                  (long long) v.windows, v.ms_wait / w, v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
+                    // this request's layers: from the host seeing the layer's doorbell to flag A going up (door_latency.hpp)
+                    if ((size_t) st < door0.size())
+                        std::fprintf(stderr, "strata serve: stage %d: doorbell -> flag A, this request: %s\n", st,
+                                     strata::core::DoorLatency::describe(v.door_lat.since(door0[(size_t) st])).c_str());
                 }
+            if (drive.d.recall != nullptr)   // STRATA_LOOKAHEAD_RECALL: this request's recall (the counter was reset where it started)
+                std::fputs(strata::core::LookaheadRecall::format(recall.take(), recall_level, recall_k_pred).c_str(), stderr);
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 // (this device's owned ordinals; a split's other stages hold theirs)
@@ -11762,7 +11876,7 @@ int main(int argc, char** argv) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());

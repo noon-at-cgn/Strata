@@ -47,6 +47,7 @@ namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
+class LookaheadRecall;   // lookahead_recall.hpp
 struct LoadStats;
 
 namespace detail {
@@ -306,6 +307,7 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
+    LookaheadRecall* recall = nullptr;      ///< STRATA_LOOKAHEAD_RECALL: scores the router lookahead against the true routing (measurement only)
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
