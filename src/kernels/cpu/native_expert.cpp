@@ -87,6 +87,32 @@ bool q8k_avx2(int type) {
 void native_set_q8k_avx2(bool on) { q8k_avx2_flag().store(on && cpu_avx2_ok(), std::memory_order_relaxed); }
 bool native_q8k_avx2() { return q8k_avx2_flag().load(std::memory_order_relaxed); }
 
+// The Q4_K / Q5_1 / Q8_0 row kernels of Unsloth UD-Q4_K_XL experts: 0 ggml-cpu's per-token vec_dot, 1 kq256 (multi-
+// token groups only), 2 fast (every group).  All three produce the same bits for every row and token (kq_fast_parity),
+// so the mode may be flipped at any time, even while the pool runs.  STRATA_KQ_KERNEL=ggml|kq256|fast (or 0|1|2);
+// unset: STRATA_KQ256=1 means kq256 (as before), else ggml.  Modes 1 and 2 need AVX2 (checked here, not per call).
+namespace {
+std::atomic<int>& kq_kernel_atomic() {
+    static std::atomic<int> mode{[] {
+        int m = kKqGgml;
+        if (const char* v = std::getenv("STRATA_KQ_KERNEL")) {
+            const std::string s(v);
+            if (s == "fast" || s == "2") m = kKqFast;
+            else if (s == "kq256" || s == "1") m = kKq256;
+        } else if (const char* k = std::getenv("STRATA_KQ256")) {
+            if (std::atoi(k) != 0) m = kKq256;
+        }
+        return cpu_avx2_ok() ? m : (int) kKqGgml;
+    }()};
+    return mode;
+}
+}  // namespace
+
+void native_set_kq_kernel(int mode) {
+    kq_kernel_atomic().store(cpu_avx2_ok() && mode >= kKqGgml && mode <= kKqFast ? mode : (int) kKqGgml, std::memory_order_relaxed);
+}
+int native_kq_kernel() { return kq_kernel_atomic().load(std::memory_order_relaxed); }
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
@@ -133,11 +159,15 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // them.  That path loops over tokens itself, so it is correct for any `nt`, not just one.
     static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
-    // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
-    // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
-    // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
-    if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
+    // Unsloth UD-Q4_K_XL's Q4_K gate/up: the AVX-2 kernels are bit-exact against ggml's per-token dot (any group size,
+    // no #152 rule); native_kq_kernel() picks them (default: ggml's dot).  kq256 (STRATA_KQ256=1, groups of 2+ tokens)
+    // was measured no faster in the engine at ~1.4 tokens per group; "fast" is the row-interleaved one (kq_avx2.cpp).
+    const int kqm = kq_kernel_atomic().load(std::memory_order_relaxed);
+    if (f.gu_type == 12 && kqm == kKqFast) {   // every group size, one token included: the same bits as ggml's dot, more throughput
+        kqfast_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
+    if (f.gu_type == 12 && kqm == kKq256 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
@@ -175,10 +205,15 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    const int kqm = kq_kernel_atomic().load(std::memory_order_relaxed);
+    const bool kq = kqm != kKqGgml;
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
+    if (cpu_avx2_ok() && kqm == kKqFast && f.d_type == 7) {   // Q5_1 down rows, every group size
+        kqfast_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
