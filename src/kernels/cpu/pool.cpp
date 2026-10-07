@@ -700,10 +700,10 @@ void ExpertPool::layer_work(int start) {
             native_down_chunk(e, c * down_rows, (std::min)(H, (c + 1) * down_rows));
             if (s.down_done.fetch_add(1, std::memory_order_acq_rel) == down_chunks - 1 &&
                 lexp_down_done_.fetch_add(1, std::memory_order_acq_rel) == n - 1)
-                done_.store(1, std::memory_order_release);
+                layer_done_.store(1, std::memory_order_release);
         }
         if (!any) {
-            if (done_.load(std::memory_order_acquire) != 0) break;
+            if (layer_done_.load(std::memory_order_acquire) != 0) break;
             _mm_pause();
         }
     }
@@ -717,10 +717,6 @@ void ExpertPool::set_layer_chunks(int gu_rows, int down_rows) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
-    if (mode_ == 7) {   // the Counters drain: no claims through head_
-        layer_work(id >= 0 ? id : n_);
-        return;
-    }
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
@@ -738,6 +734,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 7) {
+            layer_work(id);   // the Counters drain: this ticket's holder works on the layer until it is done
         } else if (mode_ == 5 || mode_ == 6) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
@@ -933,7 +931,10 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
 void ExpertPool::run_layer_counters(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     const auto t0 = std::chrono::steady_clock::now();
-    wait_parked("before a layer");
+    // No wait for the workers to be parked: a worker joins this layer by CLAIMING one of `n_` tickets from head_, a CAS
+    // that only succeeds for the epoch it woke for (issue #29), so a worker that is still asleep or late - and wakes
+    // after the layer, or into the next one - claims nothing of this layer.  A claimed ticket's holder is waited for
+    // below, so the description cannot change under it.
     mjobs_ = jobs;
     nfmt_ = &f;
     mode_ = 7;
@@ -949,13 +950,45 @@ void ExpertPool::run_layer_counters(const NativeFmt& f, ExpertJobMulti* jobs, in
         s.down_done.store(0, std::memory_order_relaxed);
     }
     lexp_down_done_.store(0, std::memory_order_relaxed);
-    njobs_ = n;
-    begin_batch(0);   // done_ = 0 (the completion flag); no job is claimed through head_ in this mode
-    if (host_works_) layer_work(n_);
+    layer_done_.store(0, std::memory_order_relaxed);
+    njobs_ = n_;
+    const uint32_t e = begin_batch(n_);   // done_ = 0, the tickets, the epoch (release): description first
+    hstate_.store(kWaitDone, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    if (host_works_) {
+        layer_work(n_);   // returns when layer_done_ is set
+    } else {
+        uint32_t spins = 0;
+        std::chrono::steady_clock::time_point ts{};
+        while (layer_done_.load(std::memory_order_acquire) == 0) {
+            _mm_pause();
+            if ((++spins & 1023u) != 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (spins == 1024u) ts = now;
+            else if (now - ts > kStall) {
+                std::fprintf(stderr, "strata: the CPU expert pool stalled in a layer (counters drain) - stopping the engine so "
+                                     "the server can start it again (issue #29)\n");
+                strata::core::release_gpu_waits(stderr);
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
+    }
     const auto t1 = std::chrono::steady_clock::now();
-    wait_done(1);
-    const auto t2 = std::chrono::steady_clock::now();
-    wait_parked("after a layer");   // every worker is out of layer_work before the next layer rewrites its state
+    // Close the batch: no ticket can be claimed after this, and the tickets already claimed are waited for.
+    uint32_t claimed = 0;
+    {
+        uint64_t h = head_.load(std::memory_order_acquire);
+        for (;;) {
+            const uint32_t nn = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+            if ((uint32_t) (h >> 32) != e || i >= nn) { claimed = (std::min)(i, nn); break; }   // all taken
+            if (head_.compare_exchange_weak(h, h + (nn - i), std::memory_order_acq_rel, std::memory_order_acquire)) {
+                claimed = i;
+                break;
+            }
+        }
+    }
+    wait_done((int) claimed);   // each holder of a ticket adds one when it leaves layer_work
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     const auto t3 = std::chrono::steady_clock::now();
@@ -963,7 +996,7 @@ void ExpertPool::run_layer_counters(const NativeFmt& f, ExpertJobMulti* jobs, in
     mode_ = 0;
     ++counter_layers;
     ms_counter_layer += std::chrono::duration<double, std::milli>(t3 - t0).count();
-    ms_counter_tail += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    ms_counter_tail += std::chrono::duration<double, std::milli>(t3 - t1).count();
     ms_drain_ += std::chrono::duration<double, std::milli>(t3 - t0).count();
 }
 

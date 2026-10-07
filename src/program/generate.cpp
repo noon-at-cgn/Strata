@@ -418,6 +418,8 @@ struct Options {
     strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
     /// --host-core first|last (STRATA_HOST_CORE): the host thread's core (see HostCore in pool.hpp)
     std::string host_core;
+    std::string cpu_kernel;   ///< --cpu-kernel ggml|kq256|fast ("" = STRATA_KQ_KERNEL / ggml)
+    std::string pool_drain;   ///< --pool-drain barriered|counters ("" = STRATA_POOL_DRAIN / barriered)
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
@@ -871,6 +873,13 @@ void usage() {
                  "  --pool-affinity MODE Worker CPU affinity: all (default: one worker per physical core, as\n"
                  "                       always), auto (hybrid CPUs: P-cores first, then their SMT siblings,\n"
                  "                       then E-cores) or p-cores (P-cores and their siblings only).\n"
+                 "  --cpu-kernel K       The Q4_K / Q5_1 CPU expert row kernels (Unsloth UD-Q4_K_XL): ggml (the default:\n"
+                 "                       ggml-cpu's dot per token), kq256 (multi-token groups only) or fast (row-interleaved,\n"
+                 "                       every group).  Same bits for all three (STRATA_KQ_KERNEL sets it too; a request's\n"
+                 "                       strata_tune cpu_kernel picks per request).\n"
+                 "  --pool-drain D       How the pool drains a layer: barriered (the default: three phases) or counters\n"
+                 "                       (one publish, per-expert atomic counters, no barriers).  Same bits\n"
+                 "                       (STRATA_POOL_DRAIN sets it too; a request's strata_tune pool_drain picks).\n"
                  "  --coupled-draft      enable coupled draft sampling for MTP drafter under sampling (STRATA_SPEC_COUPLED)\n"
                  "  --no-coupled-draft   disable coupled draft sampling (propose argmax drafts)\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
@@ -1698,6 +1707,22 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: unknown --pool-affinity value '%s' (expected auto, p-cores, or all)\n", v.c_str());
                 return 2;
             }
+        }
+        else if (a == "--cpu-kernel") {
+            const std::string v = next("--cpu-kernel");
+            if (v != "ggml" && v != "kq256" && v != "fast") {
+                std::fprintf(stderr, "strata generate: unknown --cpu-kernel value '%s' (expected ggml, kq256 or fast)\n", v.c_str());
+                return 2;
+            }
+            o.cpu_kernel = v;
+        }
+        else if (a == "--pool-drain") {
+            const std::string v = next("--pool-drain");
+            if (v != "barriered" && v != "counters") {
+                std::fprintf(stderr, "strata generate: unknown --pool-drain value '%s' (expected barriered or counters)\n", v.c_str());
+                return 2;
+            }
+            o.pool_drain = v;
         }
         else if (a == "--no-host-worker") o.no_host_worker = true;
         else if (a == "--no-ple-prefetch") o.no_ple_prefetch = true;
@@ -3982,6 +4007,18 @@ int main(int argc, char** argv) {
                              "(--host-core %s)\n", pool.workers(), on.c_str(), ht.host_core,
                      pool.host_works() ? " (draining too)" : "",
                      strata::kernels::cpu::host_core_setting() == strata::kernels::cpu::HostCore::Last ? "last" : "first");
+    }
+    {   // the CPU experts' row kernels and the pool's layer drain: --cpu-kernel / --pool-drain beat STRATA_KQ_KERNEL / STRATA_POOL_DRAIN
+        if (!o.cpu_kernel.empty())
+            strata::kernels::cpu::native_set_kq_kernel(o.cpu_kernel == "ggml" ? 0 : o.cpu_kernel == "kq256" ? 1 : 2);
+        if (!o.pool_drain.empty())
+            pool.set_layer_drain(o.pool_drain == "counters" ? strata::kernels::cpu::ExpertPool::LayerDrain::Counters
+                                                            : strata::kernels::cpu::ExpertPool::LayerDrain::Barriered);
+        static const char* kern_names[] = {"ggml", "kq256", "fast"};
+        std::fprintf(stderr, "strata generate: CPU expert rows (Q4_K / Q5_1) on the %s kernel; the pool drains a layer %s\n",
+                     kern_names[std::clamp(strata::kernels::cpu::native_kq_kernel(), 0, 2)],
+                     pool.layer_drain() == strata::kernels::cpu::ExpertPool::LayerDrain::Counters ? "with per-expert counters (no barriers)"
+                                                                                                   : "in three barriered phases");
     }
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
@@ -8799,6 +8836,8 @@ int main(int argc, char** argv) {
             int req_pipe_k = 0;
             int req_pipeline_windows = -1;   // pipeline_windows=0|2: --pipeline-windows for this request (-1 = the start-up value)
             int req_pcie_balance = -1;   // pcie_balance=0|1: the cost-balanced PCIe share for this request (-1: --pcie-balance)
+            int req_cpu_kernel = -1;   // cpu_kernel=ggml|kq256|fast: the Q4_K/Q5_1 expert row kernels (same bits; -1 = the start-up value)
+            int req_pool_drain = -1;   // pool_drain=barriered|counters: the pool's layer drain (same bits; -1 = the start-up value)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8829,6 +8868,13 @@ int main(int argc, char** argv) {
                     else if (key == "batch_overlap") req_batch_overlap = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "pipeline_windows") req_pipeline_windows = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 2);
                     else if (key == "prefill_pipe_k") req_pipe_k = std::max(std::atoi(tok.c_str() + eq + 1), 0);
+                    else if (key == "cpu_kernel") {
+                        const std::string v = tok.substr(eq + 1);
+                        req_cpu_kernel = v == "ggml" ? 0 : v == "kq256" ? 1 : v == "fast" ? 2 : -1;
+                    } else if (key == "pool_drain") {
+                        const std::string v = tok.substr(eq + 1);
+                        req_pool_drain = v == "barriered" ? 0 : v == "counters" ? 1 : -1;
+                    }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9691,6 +9737,13 @@ int main(int argc, char** argv) {
             {   // q8k_avx2=: byte-identical either way; with batch slots the latest admitted request's value holds for the windows
                 static const bool q8k_start = strata::kernels::cpu::native_q8k_avx2();
                 strata::kernels::cpu::native_set_q8k_avx2(req_q8k_avx2 < 0 ? q8k_start : req_q8k_avx2 != 0);
+            }
+            {   // cpu_kernel= / pool_drain=: the same bits whichever is chosen (kq_fast_parity, pool_layer_test); with batch slots
+                // the latest admitted request's value holds, like q8k_avx2
+                static const int kern_start = strata::kernels::cpu::native_kq_kernel();
+                strata::kernels::cpu::native_set_kq_kernel(req_cpu_kernel < 0 ? kern_start : req_cpu_kernel);
+                static const int drain_start = (int) pool.layer_drain();
+                pool.set_layer_drain((strata::kernels::cpu::ExpertPool::LayerDrain) (req_pool_drain < 0 ? drain_start : req_pool_drain));
             }
             if (o.batch > 0) {   // like pcie_frac, the latest admitted request's value holds for the batch windows after it
                 static const bool overlap_start = strata::core::Verifier::batch_overlap();
@@ -10710,6 +10763,15 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                {   // the pool's cost per distinct CPU expert (the "CPU" figure above over the experts it computed), and what ran it
+                    static const char* kern_names[] = {"ggml", "kq256", "fast"};
+                    const int64_t dn = d1.misses - ds0.misses;
+                    std::fprintf(stderr, "strata decode timing: CPU pool %.4f ms per distinct CPU expert (%.3f ms over %lld experts, "
+                                         "%.2f per window); CPU kernel %s, pool drain %s\n",
+                                 dn > 0 ? (d1.run - ds0.run) / (double) dn : 0.0, d1.run - ds0.run, (long long) dn, (double) dn / w,
+                                 kern_names[std::clamp(strata::kernels::cpu::native_kq_kernel(), 0, 2)],
+                                 pool.layer_drain() == strata::kernels::cpu::ExpertPool::LayerDrain::Counters ? "counters" : "barriered");
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
@@ -11827,8 +11889,12 @@ int main(int argc, char** argv) {
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
                         pool.ms_multi_q / rounds, pool.ms_multi_down / rounds,
-                        (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down),
+                        (double) pool.multi_bytes / 1e6 / std::max(1e-9, pool.ms_multi_gu + pool.ms_multi_down + pool.ms_counter_layer),
                         (drive.cpu_ms - pool_ms0) / rounds);
+        if (rounds > 0 && pool.counter_layers > 0)
+            std::printf("%-24s %lld layers by per-expert counters: %.3f ms/layer (the host waited %.3f ms/layer for the flag after its share)\n",
+                        "pool counters", (long long) pool.counter_layers, pool.ms_counter_layer / (double) pool.counter_layers,
+                        pool.ms_counter_tail / (double) pool.counter_layers);
         if (rounds > 0)
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,

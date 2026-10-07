@@ -1273,6 +1273,22 @@ class SamplingKeys(unittest.TestCase):
             self.assertFalse([x for x in k if x.split("=")[0] == "pipeline_windows"], bad)
         self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("pipeline_windows")])
 
+    def test_cpu_kernel_key(self):
+        for val in ("ggml", "kq256", "fast"):
+            self.assertIn(f"cpu_kernel={val}", self.keys(temperature=0, strata_tune={"cpu_kernel": val}))
+        for bad in ("Fast", "avx2", 2, 0, True, None, ["fast"], ""):
+            k = self.keys(strata_tune={"cpu_kernel": bad})
+            self.assertFalse([x for x in k if x.split("=")[0] == "cpu_kernel"], bad)
+        self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("cpu_kernel")])
+
+    def test_pool_drain_key(self):
+        for val in ("barriered", "counters"):
+            self.assertIn(f"pool_drain={val}", self.keys(temperature=0, strata_tune={"pool_drain": val}))
+        for bad in ("Counters", "free", 1, 0, True, None, ["counters"], ""):
+            k = self.keys(strata_tune={"pool_drain": bad})
+            self.assertFalse([x for x in k if x.split("=")[0] == "pool_drain"], bad)
+        self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("pool_drain")])
+
     def test_tune_pcie_balance(self):
         for val, want in ((True, "pcie_balance=1"), (1, "pcie_balance=1"), (False, "pcie_balance=0"), (0, "pcie_balance=0"),
                           (1.0, "pcie_balance=1"), (0.0, "pcie_balance=0")):

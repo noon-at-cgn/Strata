@@ -48,8 +48,10 @@ bool native_q8k_avx2();
 enum KqKernel : int {
     kKqGgml = 0,   ///< ggml-cpu's one-token vec_dot per row and token (the default)
     kKq256 = 1,    ///< the multi-token AVX-2 kernels, for groups of two or more tokens
-    kKqFast = 2,   ///< the row-interleaved AVX-2 kernels, for every group size (kq_avx2.cpp)
+    kKqFast = 2,   ///< the row-interleaved AVX-2 kernels (kq_avx2.cpp) for groups of up to kKqFastMaxTokens tokens, kq256 for bigger ones
 };
+/// The largest group of tokens the "fast" kernels take in one pass (kq_avx2.cpp); bigger groups run on kq256.
+inline constexpr int kKqFastMaxTokens = 4;
 /// Start-up value: STRATA_KQ_KERNEL=ggml|kq256|fast (0|1|2); unset: STRATA_KQ256=1 -> kq256, else ggml.  A CPU without
 /// AVX-2 always runs ggml.  native_set_kq_kernel clamps an unknown mode to ggml.
 void native_set_kq_kernel(int mode);

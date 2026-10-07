@@ -163,13 +163,18 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // no #152 rule); native_kq_kernel() picks them (default: ggml's dot).  kq256 (STRATA_KQ256=1, groups of 2+ tokens)
     // was measured no faster in the engine at ~1.4 tokens per group; "fast" is the row-interleaved one (kq_avx2.cpp).
     const int kqm = kq_kernel_atomic().load(std::memory_order_relaxed);
-    if (f.gu_type == 12 && kqm == kKqFast) {   // every group size, one token included: the same bits as ggml's dot, more throughput
-        kqfast_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
-        return;
-    }
-    if (f.gu_type == 12 && kqm == kKq256 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
-        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
-        return;
+    if (f.gu_type == 12 && kqm != kKqGgml) {
+        // "fast": every group of up to four tokens, one token included; five or more tokens share the weights across all
+        // of them in kq256 (measured faster there, kq_fast_parity --bench).  kq256 alone: groups of two or more tokens (one
+        // token: ggml's own dot below, the same bits with less overhead).  All of them give ggml's bits.
+        if (kqm == kKqFast && nt <= kKqFastMaxTokens) {
+            kqfast_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            return;
+        }
+        if (nt >= 2) {
+            kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            return;
+        }
     }
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
@@ -210,7 +215,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
-    if (cpu_avx2_ok() && kqm == kKqFast && f.d_type == 7) {   // Q5_1 down rows, every group size
+    if (cpu_avx2_ok() && kqm == kKqFast && nt <= kKqFastMaxTokens && f.d_type == 7) {   // Q5_1 down rows, groups of up to four tokens
         kqfast_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
