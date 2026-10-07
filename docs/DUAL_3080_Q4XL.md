@@ -43,7 +43,8 @@ the arena mode (every expert in RAM, 71.7 + 26.8 GiB) cannot fit and the residen
   systemd with `LimitMEMLOCK=infinity` (or at least 32 GiB). Without it the table silently stays evictable and is
   re-read from disk.
 - **`--vram-reserve-mib 1100`**: at 700 the MTP draft head did not fit (276 MiB needed, 236 free) after the cache
-  took the rest; `--pipeline-windows` would want ~200 MiB more per card.
+  took the rest. `--pipeline-windows 2` keeps its second verifiers (160 MiB per card) and, on CUDA0, two copies of the
+  first stage's recurrent state out of the expert caches itself; the start-up line says how much per card.
 - **`--max-context 262144` per lane with a 524,288 pool** gives two full-length conversations of headroom and keeps
   the model inside its trained length (no YaRN). A single 512k conversation needs `--rope-scaling yarn --rope-scale 2`
   (untested on this quant).
@@ -143,7 +144,10 @@ CPU** (`"gpu": false`, 12 threads, up to 1024 image tokens), so it costs no VRAM
 - Greedy output is not reproducible run to run (solo or slot): the adaptive expert cache moves experts between GPU
   and CPU compute (DETAILS.md documents `--adapt-every 100000` for reproducible output). The solo-vs-slot exactness
   of the pool was therefore not testable; cross-lane isolation was (distinct needles).
-- `--pipeline-windows 2`, `STRATA_PREFILL_HELP`, chunk size and `--pcie-frac` tuning; `k8v4` with the pool; parking and
+- `--pipeline-windows 2` beside `--batch`, `--batch-mtp`, `--adapt-async 1`, parking and `--vision` with this pool
+  (opt-in on this branch, see [MULTI_GPU.md](MULTI_GPU.md): only a request that decodes alone is pipelined; it has
+  been built and its decision tables tested on a CPU box, not run on these cards; `strata_tune {"pipeline_windows": 0|2}`
+  compares it with the serial loop per request), `STRATA_PREFILL_HELP`, chunk size and `--pcie-frac` tuning; `k8v4` with the pool; parking and
   session files with the pool (a stale-retained-K/V bug in parking with the pool, found by review, is fixed and
   CPU-tested - `conversation_cache_test` - but the combination itself has not been run on these cards); YaRN at 512k.
 - Only CUDA was compiled (the HIP `block()` path of the pool is untested).

@@ -143,6 +143,8 @@ bool one_token_self_commit() {
 #endif
 }
 
+std::atomic<size_t> g_mapped_bytes{0};   // see Verifier::mapped_bytes
+
 bool mapped(size_t bytes, void** h, void** d) {
 #if defined(STRATA_USE_HIP)
     if (g_coherent) {
@@ -150,11 +152,13 @@ bool mapped(size_t bytes, void** h, void** d) {
                                         (peer_portable() ? hipHostMallocPortable : 0)) != hipSuccess)
             return false;
         std::memset(*h, 0, bytes);
+        g_mapped_bytes += bytes;
         return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
     }
 #endif
     if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
     std::memset(*h, 0, bytes);
+    g_mapped_bytes += bytes;
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
 
@@ -2060,6 +2064,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+size_t Verifier::mapped_bytes() { return g_mapped_bytes.load(); }
 
 bool Verifier::commit(int n_keep, std::string& err) {
     const OnDevice on_device(device_);

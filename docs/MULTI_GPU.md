@@ -214,17 +214,33 @@ Two cards, exactly two stages, `--serve`. In the config:
 ```
 
 - **Cost**: a second verify window on each card, 160 MiB more kept out of each card's expert cache, plus two copies
-  of the first card's recurrent state (about 3 MiB per GDN layer it runs) on the first card with `2`.
+  of the first card's recurrent state (about 3 MiB per GDN layer it runs) on the first card with `2`. The engine says
+  what it kept out of each card, and the page-locked host RAM the second verifiers and the second hand-off took
+  (measured at start-up, not estimated), in one line: `--pipeline-windows 2: two verifiers per stage ... kept out of the
+  expert caches: CUDA0 ... MiB, CUDA1 ... MiB; extra pinned RAM ... MiB`.
 - **Same text**: the last card only ever runs windows that are verified, and every window row computes what it
   would in any other window, so the tokens are the serial loop's. With `STRATA_IQ_MT_MIN=1 --pcie-frac 0
   --adapt-every 0` the greedy output is identical bit for bit to the serial loop's with the same expert caches. The pipeline keeps
   its VRAM out of the caches, so against a run without the flag a few experts move from a card to the CPU, which
   rounds them differently, and a near-tie can flip (a serial run given the same caches through `--vram-reserve-mib`
   matches it exactly).
-- **Off, with one line in the log saying why**, with `--batch` slots, `--peer-device`, the helper caches
-  (`--expert-cache-device1..3`, `--remote-expert-opt`), a split into three or more stages or onto one GPU
-  (`--split-device 0`), or no draft layer. A request with repetition penalties (`penalty_last_n`) or coupled
+- **Off, with one line in the log saying why**, with `--batch-groups` (the pipelined slot groups), `--peer-device`,
+  the helper caches (`--expert-cache-device1..3`, `--remote-expert-opt`), a split into three or more stages or onto
+  one GPU (`--split-device 0`), or no draft layer. A request with repetition penalties (`penalty_last_n`) or coupled
   draft sampling decodes serially.
+- **With `--batch` slots** (the `--batch N` of [BATCHING.md](BATCHING.md)): only for a request that decodes alone. A
+  request decodes serially, said once in the log, while a slot is decoding or a request waits to be admitted to a
+  slot; the batch windows themselves are not pipelined. The short prompt reads through the verify windows
+  (`--short-read`) go serial while a slot is decoding too.
+- **With the shared KV pool** (`--kv-pool-tokens`): the loop does not back the whole context at the start, which would
+  take the cached conversations of the idle slots. Backing more cells waits for the moment no window is in flight (a
+  window in flight may be waiting for the host, and growing the pool synchronizes the device), so it grows a 4096-cell
+  step at a time with the next step already included, and a guessed window that would go past the backed cells is not
+  started. The window after such a point runs without the overlap. A pool that cannot back the next window ends the
+  request there, as in the serial loop (`KV pool full: the request ends at N tokens` in the log; the server flags the
+  answer truncated).
+- **Per request**: `strata_tune {"pipeline_windows": 0}` decodes that request serially and `2` pipelined (only if the
+  engine was started with `--pipeline-windows 2`); a request without the key goes back to the start-up setting.
 - **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
   advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
   no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM
@@ -237,8 +253,8 @@ Two cards, exactly two stages, `--serve`. In the config:
   (`--mmap-experts` on that 32 GB PC) the file reads dominate and it measured no faster.
 
 The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with
-`STRATA_PIPELINE_DEBUG=1`. `--pipeline-windows` and `--adapt-async 1` exclude each other (the engine says so and keeps the
-pipeline).
+`STRATA_PIPELINE_DEBUG=1`. `--pipeline-windows 1` and `--adapt-async 1` exclude each other (the engine says so and
+keeps the pipeline); `--pipeline-windows 2` works beside it, see above.
 
 ## Several conversations at once
 

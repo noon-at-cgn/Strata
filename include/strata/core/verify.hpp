@@ -187,6 +187,9 @@ public:
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
     static void set_commit_async(bool on);
+    /// Bytes of page-locked mapped host memory the verifiers have allocated so far (their staging and flag words); the
+    /// difference across an init() is what that verifier pinned.
+    static size_t mapped_bytes();
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
