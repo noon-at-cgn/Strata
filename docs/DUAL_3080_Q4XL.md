@@ -144,5 +144,6 @@ CPU** (`"gpu": false`, 12 threads, up to 1024 image tokens), so it costs no VRAM
   and CPU compute (DETAILS.md documents `--adapt-every 100000` for reproducible output). The solo-vs-slot exactness
   of the pool was therefore not testable; cross-lane isolation was (distinct needles).
 - `--pipeline-windows 2`, `STRATA_PREFILL_HELP`, chunk size and `--pcie-frac` tuning; `k8v4` with the pool; parking and
-  session files with the pool; YaRN at 512k.
+  session files with the pool (a stale-retained-K/V bug in parking with the pool, found by review, is fixed and
+  CPU-tested - `conversation_cache_test` - but the combination itself has not been run on these cards); YaRN at 512k.
 - Only CUDA was compiled (the HIP `block()` path of the pool is untested).
