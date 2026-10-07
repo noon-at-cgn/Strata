@@ -198,8 +198,9 @@ public:
     /// Rows per chunk of the Counters drain (gate/up, down); multiples of 4 keep the row-interleaved kernels at four
     /// rows per pass.  STRATA_POOL_GU_ROWS / STRATA_POOL_DOWN_ROWS set the start-up values (defaults 20 and 80).
     void set_layer_chunks(int gu_rows, int down_rows);
-    /// The Counters drain's totals since construction: layers, and the milliseconds from the publish to the last worker
-    /// parked (the call's whole duration) / of those, what the host waited for the completion flag after its own share.
+    /// The Counters drain's totals since construction: layers, and the milliseconds from the publish to the call's end (the
+    /// last claimed ticket's holder out of the layer) / of those, the time after the host's own share (with host_works, the
+    /// completion flag) until the last holder left.
     int64_t counter_layers = 0;
     double ms_counter_layer = 0, ms_counter_tail = 0;
     static constexpr int kMaxSplitMulti = 96;
