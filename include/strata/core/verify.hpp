@@ -26,6 +26,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/verify_variant.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -263,7 +264,13 @@ public:
     /// (`n` <= 8 blobs of `bytes` each, the fastest of `reps` rounds after a warm-up), in ms; <= 0 with `err` set when
     /// it cannot be measured.  Between windows only (no new memory: it reuses the window's own staging and copy stream).
     double probe_pcie_ms_per_mib(const uint8_t* const* src, int n, size_t bytes, int reps, std::string& err);
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// The request's PCIe share is 0 for this stage (`--pcie-frac 0`, a request's `pcie_frac` of 0, or below 1/512):
+    /// its next windows run the captured graph WITHOUT flag B's wait and the PCIe group (`verify_variant.hpp`), and
+    /// the host plans them with a share of 0 and never raises flag B for them.  Takes effect at the next window's
+    /// launch (a window in flight keeps the variant it launched with); false: the graph with the PCIe share, valid
+    /// for any share including 0.  The variant is captured on first use (or by `capture_all`), beside the other.
+    void set_pcie_off(bool off) { pcie_off_ = off; }
+    bool pcie_off() const { return pcie_off_; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
@@ -289,17 +296,9 @@ private:
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
-        std::vector<int> k = batch_key(rows, S, hbase);
-        k.push_back(ar_off_ ? 1 : 0);
-        return k;
+        return batch_graph_key(rows, S, hbase, ar_off_, np_);   // ... and so has the no-PCIe-share variant
     }
-    static std::vector<int> batch_key(const int* rows, int S, int hbase) {
-        std::vector<int> k;
-        k.reserve((size_t) S + 1);
-        k.push_back(hbase);
-        for (int t = 0; t < S; ++t) k.push_back(rows[t]);
-        return k;
-    }
+    std::vector<int> ckey(const int* rows, int S, int hbase) const { return commit_graph_key(bkey(rows, S, hbase)); }
     // batch_launch / batch_poll
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
@@ -401,6 +400,21 @@ private:
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    cudaGraphExec_t exec_np_[9] = {};     // the same two, captured without flag B's wait and the PCIe group (no PCIe share)
+    cudaGraphExec_t exec_nr_np_[9] = {};
+    /// The solo window graph for window size `T` in the variant the next window runs (ar_off_, np_).
+    cudaGraphExec_t& solo_exec(int T) { return ar_off_ ? (np_ ? exec_nr_np_[T] : exec_nr_[T]) : (np_ ? exec_np_[T] : exec_[T]); }
+    // ---- the PCIe share's part of the window graph (verify_variant.hpp)
+    bool pcie_off_ = false;   ///< set_pcie_off: the engine's request asks for a share of 0
+    bool np_ = false;         ///< the next window runs the no-PCIe variant (refresh_variant, at each window's launch)
+    bool b_wait_ = true;      ///< ... and its graph waits for flag B, so the host raises it
+    void refresh_variant(bool allow_no_pcie = true);   ///< np_, b_wait_ and the sink's flag from pcie_off_ and the stage
+    void raise_b(uint32_t want) { if (b_wait_) raise_flag(h_flagB_, want); }
+    /// After a layer's pool call: a window captured without a PCIe share must not have been planned one.  False (err
+    /// set, the GPU's waits released) when it was.
+    bool plan_fits_graph(std::string& err);
+    /// Free the solo graphs of the variants the next window does not run (they are captured again when needed).
+    bool evict_idle_variants(bool& evicted, std::string& err);
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)

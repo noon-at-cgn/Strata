@@ -6518,14 +6518,16 @@ int main(int argc, char** argv) {
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
         bool pl_prepared = false;
-        // every graph captured and the drafter's prompt path sized while nothing is in flight (a capture syncs its stream)
+        // every graph captured and the drafter's prompt path sized while nothing is in flight (a capture syncs its stream).
+        // The graphs are checked on every call: a request whose PCIe share differs from the last one's (0 or not) needs
+        // the window graph of the other variant, which capture_all captures now, and does nothing for one already captured.
         auto pl_prepare = [&](std::string& e) -> bool {
-            if (pl_prepared) return true;
             for (int st = 0; st < 2; ++st)
                 for (int par = 0; par < 2; ++par) {
                     const strata::core::OnDevice on(PV[st][par]->device());
                     if (!PV[st][par]->capture_all(e)) return false;
                 }
+            if (pl_prepared) return true;
             if (!mtp.prepare_prefill(e)) return false;
             if (o.pipeline_windows >= 2 && pl_snap2[0] != nullptr && !mtp.prepare_chain(e)) return false;
             const strata::core::OnDevice on(mtp.device());
@@ -6963,6 +6965,18 @@ int main(int argc, char** argv) {
         for (int st = 0; st < n_stages && st < (int) pcie_bal.size(); ++st)
             pcie_bal[(size_t) st].ref_mib = (double) strata::kernels::cpu::expert_layout().blob_bytes(
                 st == 0 ? 0 : stages[(size_t) st - 1]->lb) / 1048576.0;
+        // The PCIe share's variant of every verify window (Verifier::set_pcie_off): a stage whose share is 0 - --pcie-frac 0,
+        // a request's pcie_frac of 0 - runs the window graph without flag B's wait and the PCIe group, and its plans carry
+        // no PCIe group (the verifier's sink keeps the pool to that).  Called wherever the shares are set; the variant
+        // is captured the first time a window of it runs (pipelined windows: by pl_prepare, below).
+        auto apply_pcie_variants = [&]() {
+            for (int st = 0; st < n_stages; ++st) {
+                const bool off = (n_stages > 1 ? split_drive.pcie_num[st] : drive.d.pcie_num) == 0;
+                stage_ver(st).set_pcie_off(off);
+                if (pipe) (st == 0 ? ver_b : stages[0]->ver_b).set_pcie_off(off);
+            }
+        };
+        apply_pcie_variants();
         // --pcie-balance (flag or STRATA_PCIE_BALANCE=1; a request's pcie_balance key beats both)
         const bool pcie_balance_default = [&] {
             const char* e = std::getenv("STRATA_PCIE_BALANCE");
@@ -9723,6 +9737,7 @@ int main(int argc, char** argv) {
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
+            apply_pcie_variants();
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
@@ -11456,6 +11471,7 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        ver.set_pcie_off(drive.d.pcie_num == 0);   // no PCIe share: the window graph without flag B's wait and the PCIe group
         const int64_t pcie0 = drive.d.pcie_experts;
         // CS-T: the file tier since the decode began (the prompt path's copies are before this)
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
