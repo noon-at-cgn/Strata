@@ -925,6 +925,11 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+            # prefill_pipe_k: prompt chunks a read beside decoding slots takes per pipeline run (a layer split;
+            # 1 = one chunk, as before).  A whole number; anything else is not sent.
+            kp = tune.get("prefill_pipe_k")
+            if isinstance(kp, int) and not isinstance(kp, bool) and 1 <= kp <= 16:
+                keys += f" prefill_pipe_k={kp}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

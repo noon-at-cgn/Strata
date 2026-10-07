@@ -61,6 +61,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/prefill_parts.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -8481,6 +8482,9 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            // prefill_pipe_k=N: how many prompt chunks a read beside decoding slots takes per pipeline run (a layer
+            // split); 0 = not asked: STRATA_PREFILL_PIPE_K, else 1
+            int req_pipe_k = 0;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8506,6 +8510,7 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "prefill_pipe_k") req_pipe_k = std::max(std::atoi(tok.c_str() + eq + 1), 0);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9247,11 +9252,21 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
-            // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
-            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
+            // --batch: a prompt read while slots are decoding goes in parts of prompt chunks (the same chunks as one
+            // run: each run starts where the last ended, at a multiple of the chunk), and between two parts the slots
+            // decode for a share of the time the part took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
             // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
             // borrowed (marked missing: those experts run on the CPU), never a prompt buffer.
+            // A part is one chunk by default.  With a layer split a part of k chunks (STRATA_PREFILL_PIPE_K, or the
+            // request's prefill_pipe_k) is ONE run: the stages overlap their chunks inside it, so k chunks take about
+            // (k + 1) stage times, not 2k.  The chunks, their positions and their arithmetic are the same as with k = 1;
+            // only where the slots get their turn moves (every k chunks), so the decode share is scaled to keep the
+            // slots' decode time per prompt token what k = 1 gives (see `budget`).
+            static const int64_t pipe_k_env = [] {
+                const char* v = std::getenv("STRATA_PREFILL_PIPE_K");
+                return v != nullptr ? (int64_t) std::atoi(v) : 1;
+            }();
+            const int64_t pipe_k = stages.empty() ? 1 : strata::program::prefill_pipe_k(req_pipe_k, pipe_k_env);
             static const double decode_share = [] {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
@@ -9270,7 +9285,8 @@ int main(int argc, char** argv) {
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const int64_t r = strata::program::prefill_part_end(q, b0, C, pipe_k);   // the last part: what is left
+                    const int64_t nch = strata::program::prefill_part_chunks(q, r, C);   // the chunks this part reads
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
@@ -9325,7 +9341,13 @@ int main(int argc, char** argv) {
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
                     if (decode_share <= 0.0 || !batch_on()) continue;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    // k chunks in one run take about (k + 1) stage times where k runs of one take 2k: the slots get
+                    // the share of what the same chunks would have taken one run each (equal stages assumed - the
+                    // 2-stage split's cards run at the same SM load), so their decode time per prompt token is the
+                    // one k = 1 gives.  A part of one chunk (k = 1, the last part): the share of its own time.
+                    const double pipe_scale = strata::program::prefill_part_decode_scale(nch);
+                    const double budget = decode_share * pipe_scale *
+                                          std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
                     do {
@@ -9467,7 +9489,8 @@ int main(int argc, char** argv) {
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
-                                     "them\n", (long long) il_parts + 1, il_ms);
+                                     "them (%lld chunk%s a part)\n", (long long) il_parts + 1, il_ms, (long long) pipe_k,
+                             pipe_k == 1 ? "" : "s");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
