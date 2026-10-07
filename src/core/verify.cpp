@@ -65,6 +65,9 @@ inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv(
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_PAIR"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_QDEDUP"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+// STRATA_VERIFY_FLAGB=1: every window graph waits for flag B before its PCIe groups, as before flag B was folded into
+// flag A for --pcie-mode 1 and 2 (verify_variant.hpp).  Default off: the wait guards nothing there.
+inline bool g_legacy_flagb() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_FLAGB"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }(); return on; }
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
@@ -343,6 +346,10 @@ Verifier::~Verifier() {
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
+        if (e) cudaGraphExecDestroy(e);
+    for (auto& e : exec_np_)
+        if (e) cudaGraphExecDestroy(e);
+    for (auto& e : exec_nr_np_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     for (auto& kv : exec_bm_)
@@ -1290,19 +1297,28 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            // The PCIe share's part of the graph.  The no-PCIe variant holds none of it: its plans carry no PCIe group
+            // (the sink's no_pcie keeps the pool from planning one; run/service check it), so there is no copy to wait
+            // for and no group to launch.  Flag B itself is only waited for where it guards DMA copies (--pcie-mode 0);
+            // in modes 1 and 2 the host raises it right after A with nothing in between, and the plan's PCIe arrays
+            // are written before A (verify_variant.hpp).
+            if (!np_) {
+                if (window_waits_flag_b(np_, sink_.pcie_mode, g_legacy_flagb())) {
+                    if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+                    else wait_flag_ge(m_flagB_, ring, cs);             // the PCIe share is in staging (DMA) or mapped
+                }
+                if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+                }
+                stamp(l, 21, grp);
+                // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none, so its
+                // launch is kPcieGroupRows block rows striding over the groups, not cap of them
+                grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+                stamp(l, 22, grp);
             }
-            stamp(l, 21, grp);
-            // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
-            // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
-            stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
@@ -1507,7 +1523,7 @@ void Verifier::refresh_ar() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    cudaGraphExec_t& exec_t = solo_exec(T);
     if (exec_t != nullptr) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
@@ -1557,13 +1573,17 @@ bool Verifier::capture(int T, std::string& err) {
         std::fprintf(stderr, "\n");
     }
 #endif
+    size_t vram0 = 0, vram1 = 0, vram_total = 0;
+    cudaMemGetInfo(&vram0, &vram_total);
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-                 cudaGetErrorString(ue), cudaGetErrorString(us));
+    cudaMemGetInfo(&vram1, &vram_total);
+    std::fprintf(stderr, "strata verify: captured the %d-token window%s (upload %s, sync %s, device memory used by the graph %.1f MiB)\n",
+                 T, np_ ? " without flag B's wait and the PCIe group (PCIe share 0)" : "", cudaGetErrorString(ue),
+                 cudaGetErrorString(us), ((double) vram0 - (double) vram1) / 1048576.0);
     return true;
 }
 
@@ -1714,6 +1734,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
     refresh_ar();
+    refresh_variant();
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1736,7 +1757,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(solo_exec(T), cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -1822,8 +1843,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
+        if (!plan_fits_graph(err)) return false;
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
         // Layer 0's VRAM experts, and before raising *flag = 1), the NVMe PLE reads overlap with both
@@ -1945,6 +1967,7 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
+    if (!v->b_wait_) return;   // the window's graph has no wait for flag B: nothing to raise (and no copy: plan_fits_graph checks)
     if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
@@ -2172,19 +2195,24 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    size_t vram0 = 0, vram1 = 0, vram_total = 0;
+    cudaMemGetInfo(&vram0, &vram_total);
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
     cudaGraphUpload(ex, cs_);
     cudaStreamSynchronize(cs_);
+    cudaMemGetInfo(&vram1, &vram_total);
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
+    std::fprintf(stderr, "strata verify: captured the batch window over slots %s%s (device memory used by the graph %.1f MiB)\n",
+                 list.c_str(), np_ ? ", without flag B's wait and the PCIe group (PCIe share 0)" : "",
+                 ((double) vram0 - (double) vram1) / 1048576.0);
     return true;
 }
 
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
-    cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
+    cudaGraphExec_t& cex = commit_bm_[ckey(rows, S, hbase)];
     if (cex != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -2295,10 +2323,12 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     if (old->second) cudaGraphExecDestroy(old->second);
     exec_bm_.erase(old);
     bm_used_.erase(old_key);
-    auto commit_old = commit_bm_.find(old_key);
-    if (commit_old != commit_bm_.end()) {
-        if (commit_old->second) cudaGraphExecDestroy(commit_old->second);
-        commit_bm_.erase(commit_old);
+    if (!commit_graph_still_used(exec_bm_, old_key)) {   // (the other PCIe-share variant of this layout shares it)
+        auto commit_old = commit_bm_.find(commit_graph_key(old_key));
+        if (commit_old != commit_bm_.end()) {
+            if (commit_old->second) cudaGraphExecDestroy(commit_old->second);
+            commit_bm_.erase(commit_old);
+        }
     }
     evicted = true;
     return true;
@@ -2310,18 +2340,24 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
     cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
-    int freed = 0;
+    int freed = 0, idle = 0;
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
         if (!evict_batch_graph(key, evicted, err)) return false;
         if (evicted) {
             ++freed;
-            ie = cudaGraphInstantiate(&ex, graph, 0);
+        } else {   // no older batch layout left: the graphs of the PCIe-share variant the next window does not run
+            if (!evict_idle_variants(evicted, err)) return false;
+            if (evicted) ++idle;
         }
+        if (evicted) ie = cudaGraphInstantiate(&ex, graph, 0);
     }
     if (freed > 0)
         std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
                              "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
+    if (idle > 0)
+        std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the solo graphs of the other variants "
+                             "(PCIe share on/off, doorbell); they are captured again when a request needs them\n");
     if (ie != cudaSuccess) {
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
@@ -2347,6 +2383,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             return false;
         }
     refresh_ar();
+    refresh_variant();
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase);
@@ -2489,8 +2526,9 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
+        if (!plan_fits_graph(err)) return false;
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
@@ -2565,7 +2603,7 @@ bool Verifier::commit_prefix_launch(const int* keep, std::string& err) {
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+    const cudaError_t le = cudaGraphLaunch(commit_bm_[ckey(last_rows_, S, row_base_)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
     return true;
 }
@@ -2611,7 +2649,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[ckey(rows, S, base)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
@@ -2675,8 +2713,9 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
+        if (!plan_fits_graph(err)) { b_running_ = false; return -1; }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
         b_last_ = Clock::now();
@@ -2734,6 +2773,7 @@ bool Verifier::capture_all(std::string& err) {
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    refresh_variant();
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
     if (!capture_commit(err)) return false;
@@ -2747,7 +2787,8 @@ bool Verifier::capture_all(std::string& err) {
         prof_pin_ = nullptr;   // the pipelined windows go unprofiled
         cudaGetLastError();
     }
-    pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
+    if (pl_ple_rows_.empty())   // (capture_all runs again when a request changes the PCIe share's variant: keep a staged window's rows)
+        pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
     return true;
 }
 
@@ -2790,7 +2831,9 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
+    refresh_variant(exec_np_[T] != nullptr);   // (no no-PCIe graph captured: the one with the share serves any share, 0 included)
+    cudaGraphExec_t& pl_exec = np_ ? exec_np_[T] : exec_[T];
+    if (pl_exec == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
         err = "verify: pipelined window not prepared (capture_all)";
         return false;
     }
@@ -2811,7 +2854,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(pl_exec, cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
@@ -2902,8 +2945,9 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err, int max_la
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
+        if (!plan_fits_graph(err)) return -1;
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
         ++fl_k_;
@@ -2997,6 +3041,49 @@ void Verifier::absorb_stats(Verifier& o) {
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;
     o.prof_windows_ = 0;
+}
+
+// The variant of the next window (verify_variant.hpp): the no-PCIe graph when the request's share is 0 and the stage is
+// not on the all-resident graph.  Called where each window is launched, after refresh_ar(); `allow_no_pcie` false is the
+// pipelined launch's fallback when only the graph with the PCIe share was captured (it serves any share, 0 included).
+void Verifier::refresh_variant(bool allow_no_pcie) {
+    const bool np = allow_no_pcie && window_without_pcie(pcie_off_, ar_on());
+    if (allow_no_pcie && np != np_ && g_ != nullptr)
+        std::fprintf(stderr, "strata verify: layers [%lld, %lld) PCIe share %s: windows run the graph %s\n", (long long) lb_,
+                     (long long) (le_ < 0 ? g_->n_layers : le_), np ? "0" : "on",
+                     np ? "without flag B's wait and the PCIe group" : "with the PCIe group");
+    np_ = np;
+    b_wait_ = window_waits_flag_b(np, sink_.pcie_mode, g_legacy_flagb());
+    sink_.no_pcie = np;
+}
+
+bool Verifier::plan_fits_graph(std::string& err) {
+    if (!np_ || sink_.counts == nullptr || *(volatile int32_t*) (sink_.counts + 2) == 0) return true;
+    err = "verify: the pool planned a PCIe share for a window whose graph has none (flag " + std::to_string(cur_layer_ + 1) +
+          ")" + released_note(release_gpu_waits(5000));
+    return false;
+}
+
+bool Verifier::evict_idle_variants(bool& evicted, std::string& err) {
+    evicted = false;
+    cudaGraphExec_t* const sets[4] = {exec_, exec_np_, exec_nr_, exec_nr_np_};   // index: (ar_off_ ? 2 : 0) | (np_ ? 1 : 0)
+    const int live = (ar_off_ ? 2 : 0) | (np_ ? 1 : 0);
+    bool any = false;
+    for (int s = 0; s < 4; ++s)
+        for (int T = 0; T < 9 && s != live; ++T) any = any || sets[s][T] != nullptr;
+    if (!any) return true;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before freeing the idle window graphs failed";
+        return false;
+    }
+    for (int s = 0; s < 4; ++s)
+        for (int T = 0; T < 9 && s != live; ++T)
+            if (sets[s][T] != nullptr) {
+                cudaGraphExecDestroy(sets[s][T]);
+                sets[s][T] = nullptr;
+            }
+    evicted = true;
+    return true;
 }
 
 }  // namespace strata::core
