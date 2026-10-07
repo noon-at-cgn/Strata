@@ -243,6 +243,79 @@ int main() {
         r = f.sample();
         check(r && r->available == 80 * GiB, "v2 memory files win over v1 when both exist");
     }
+    // the one credited kind of reclaimable memory: clean inactive file cache from the same group's memory.stat
+    {
+        const auto stat = [](uint64_t inactive, uint64_t active, uint64_t shmem, uint64_t dirty = 0, uint64_t wb = 0) {
+            return "anon 1\nfile 2\nshmem " + std::to_string(shmem) + "\ninactive_file " + std::to_string(inactive) +
+                   "\nactive_file " + std::to_string(active) + "\nfile_dirty " + std::to_string(dirty) +
+                   "\nfile_writeback " + std::to_string(wb) + "\nunevictable 5\n";
+        };
+        Fixture f;
+        f.meminfo(120 * GiB, 25 * GiB);
+        f.self("0::/system.slice/strata.service");
+        f.put("cgroup/memory.max", "max\n"); f.put("cgroup/memory.high", "max\n");
+        f.put("cgroup/memory.current", 98 * GiB + 324 * MiB);
+        f.put("cgroup/memory.stat", stat(3 * GiB + 800 * MiB, 27 * GiB, 65 * GiB));
+        f.put("cgroup/system.slice/strata.service/memory.max", "max\n");
+        f.put("cgroup/system.slice/strata.service/memory.current", 90 * GiB);
+        // the operator's cap: the root's memory.current less the root's inactive_file; active_file and shmem are not credited
+        auto r = f.sample(99 * GiB);
+        check(r && r->source == MemorySource::flag && r->available == 99 * GiB - (98 * GiB + 324 * MiB - 3 * GiB - 800 * MiB),
+              "the cap path credits the root's inactive_file");
+        check(r->credit == 3 * GiB + 800 * MiB && r->current == 98 * GiB + 324 * MiB, "reading shows the credit and the raw usage");
+        f.put("cgroup/memory.stat", stat(0, 27 * GiB, 65 * GiB));
+        r = f.sample(99 * GiB);
+        check(r && r->available == 700 * MiB && r->credit == 0, "only inactive_file counts: active_file and shmem give nothing");
+        // dirty and writeback pages are not clean: taken off the credit
+        f.put("cgroup/memory.stat", stat(3 * GiB, 0, 0, 1 * GiB, 512 * MiB));
+        r = f.sample(99 * GiB);
+        check(r && r->credit == 1 * GiB + 512 * MiB && r->available == 700 * MiB + 1 * GiB + 512 * MiB, "dirty and writeback come off");
+        f.put("cgroup/memory.stat", stat(3 * GiB, 0, 0, 2 * GiB, 2 * GiB));
+        r = f.sample(99 * GiB);
+        check(r && r->credit == 0 && r->available == 700 * MiB, "dirty plus writeback over inactive_file leaves no credit");
+        // inactive_file larger than the usage: the credit stops at the usage, headroom never exceeds the cap
+        f.put("cgroup/memory.stat", stat(500 * GiB, 0, 0));
+        f.meminfo(300 * GiB, 200 * GiB);   // so the cap's room (not MemAvailable) is the smallest term
+        r = f.sample(99 * GiB);
+        check(r && r->credit == 98 * GiB + 324 * MiB && r->available == 99 * GiB && r->source == MemorySource::flag,
+              "inactive_file above the usage cannot lift headroom over the cap");
+        // no memory.stat, or one that cannot be read: no credit, still a sample
+        fs::remove(f.dir / "cgroup/memory.stat");
+        r = f.sample(99 * GiB);
+        check(r && r->available == 700 * MiB && r->credit == 0, "no memory.stat: no credit");
+        for (const char* text : {"", "garbage\n", "inactive_file\n", "inactive_file -1\n", "inactive_file 12x\n",
+                                 "inactive_file 1\ninactive_file 2\n", "inactive_file 99999999999999999999\n",
+                                 "inactive_file 4096\nfile_dirty zz\n"}) {
+            f.put("cgroup/memory.stat", text);
+            r = f.sample(99 * GiB);
+            check(r && r->available == 700 * MiB && r->credit == 0, "unparsable memory.stat: no credit, not unknown");
+        }
+        // a cgroup limit's own group is credited from its own memory.stat
+        f.put("cgroup/memory.stat", stat(0, 0, 0));
+        f.put("cgroup/system.slice/strata.service/memory.max", 92 * GiB);
+        f.put("cgroup/system.slice/strata.service/memory.stat", stat(1 * GiB, 0, 0));
+        r = f.sample();
+        check(r && r->source == MemorySource::cgroup && r->available == 3 * GiB && r->credit == 1 * GiB &&
+                  r->limit == 92 * GiB && r->current == 90 * GiB, "a cgroup limit credits its own group's inactive_file");
+        f.put("cgroup/system.slice/strata.service/memory.stat", stat(500 * GiB, 0, 0));
+        f.meminfo(300 * GiB, 200 * GiB);
+        r = f.sample();
+        check(r && r->available == 92 * GiB && r->credit == 90 * GiB, "cgroup term: the credit stops at the usage too");
+        // cgroup v1: total_inactive_file (and total_dirty / total_writeback)
+        Fixture g;
+        g.meminfo(120 * GiB, 80 * GiB);
+        g.self("4:memory:/m");
+        g.put("cgroup/memory/m/memory.limit_in_bytes", 64 * GiB); g.put("cgroup/memory/m/memory.usage_in_bytes", 62 * GiB);
+        g.put("cgroup/memory/memory.limit_in_bytes", 9223372036854771712ull); g.put("cgroup/memory/memory.usage_in_bytes", 62 * GiB);
+        g.put("cgroup/memory/m/memory.stat", "cache 1\ninactive_file 7\ntotal_inactive_file " + std::to_string(3 * GiB) +
+                                                  "\ntotal_dirty " + std::to_string(1 * GiB) + "\ntotal_writeback 0\n");
+        r = g.sample();
+        check(r && r->available == 2 * GiB + 2 * GiB && r->credit == 2 * GiB && r->source == MemorySource::cgroup,
+              "v1 credits total_inactive_file less total_dirty");
+        g.put("cgroup/memory/m/memory.stat", "inactive_file " + std::to_string(3 * GiB) + "\n");
+        r = g.sample();
+        check(r && r->available == 2 * GiB && r->credit == 0, "v1 ignores the non-total inactive_file");
+    }
     // the process-wide setting and the real files
     {
         check(memory_limit_bytes() == 0, "no cap by default");

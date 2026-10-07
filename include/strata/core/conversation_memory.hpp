@@ -12,16 +12,18 @@ namespace strata::core {
 // available_host_bytes() is the smallest of
 //   * MemAvailable (Windows: the available physical memory);
 //   * the room under every memory limit of this process's cgroup and of each ancestor visible under
-//     /sys/fs/cgroup (cgroup v2: memory.max and memory.high, each minus memory.current; cgroup v1:
+//     /sys/fs/cgroup (cgroup v2: memory.max and memory.high, each minus usage; cgroup v1:
 //     memory.limit_in_bytes minus memory.usage_in_bytes);
 //   * the operator's own cap, when one is set (--memory-limit-mib / STRATA_MEMORY_LIMIT_MIB): that many MiB minus
 //     what the container uses now - the top visible cgroup's memory.current, or MemTotal - MemAvailable when the
 //     cgroup files cannot be read.  For a container whose real limit sits on a parent cgroup it cannot see.
 //
-// Usage is memory.current as the kernel reports it, page cache included.  The kernel could reclaim some of that cache
-// before it kills anything, so the figure errs low; but pinned or locked memory (shmem, mlock) is charged to
-// memory.current too and cannot be reclaimed, so no part of it is credited back.  A hard-limit kill is worse than a
-// skipped park.
+// Usage is memory.current as the kernel reports it, less one reclaimable kind: the clean inactive file cache of the
+// same group (memory.stat inactive_file, v1 total_inactive_file, less dirty and writeback pages, never more than
+// memory.current), which the kernel gives back at memory.high or the limit before it kills anything.  Nothing else is
+// credited: active_file holds mlocked pages, and shmem is the pinned complements and the KV pool.  A memory.stat that
+// is missing or unparsable gives no credit (it does not make the sample unknown).
+// Pinned, locked and shared memory stays charged in full: a hard-limit kill is worse than a skipped park.
 //
 // Unknown telemetry is deliberately distinct from a measured zero.  A limit file that exists but cannot be parsed
 // makes the sample unknown (fail closed); a file that is absent (no such controller, not mounted) is ignored.
@@ -38,7 +40,8 @@ struct HostMemoryReading {
     uint64_t available = 0;
     MemorySource source = MemorySource::meminfo;
     uint64_t limit = 0;
-    uint64_t current = 0;
+    uint64_t current = 0;        ///< memory.current (meminfo: MemTotal - MemAvailable), before the credit
+    uint64_t credit = 0;         ///< the clean inactive file cache counted as reclaimable (0 for meminfo)
     uint64_t mem_available = 0;
 };
 

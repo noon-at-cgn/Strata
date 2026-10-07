@@ -1910,10 +1910,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: memory guard: the available RAM cannot be read; parking and session "
                                      "save/restore are refused\n");
             } else {
-                std::fprintf(stderr, "strata generate: memory guard: limit %.1f GiB (source: %s), current %.1f GiB; "
-                                     "available %.1f GiB (MemAvailable %.1f GiB%s), floor %lld MiB\n",
+                std::fprintf(stderr, "strata generate: memory guard: limit %.1f GiB (source: %s), current %.1f GiB, "
+                                     "reclaimable cache credited %.1f GiB; available %.1f GiB (MemAvailable %.1f GiB%s), "
+                                     "floor %lld MiB\n",
                              (double) mem->limit / GiB, strata::core::memory_source_name(mem->source),
-                             (double) mem->current / GiB, (double) mem->available / GiB, (double) mem->mem_available / GiB,
+                             (double) mem->current / GiB, (double) mem->credit / GiB, (double) mem->available / GiB,
+                             (double) mem->mem_available / GiB,
                              mib > 0 ? (", --memory-limit-mib " + std::to_string((long long) mib)).c_str() : "",
                              (long long) o.conversation_cache_min_free_mib);
             }

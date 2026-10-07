@@ -1,5 +1,6 @@
 #include "strata/core/conversation_memory.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <filesystem>
@@ -71,12 +72,45 @@ Value read_value(const fs::path& path) {
     return v;
 }
 
-// What the cgroup files say: every finite limit with the usage charged against it, and the usage of the topmost
-// visible group (the root of this namespace - what a container's own limit is measured over).
+// The one reclaimable kind that is credited: clean inactive file cache, from the same group's memory.stat
+// (v2 inactive_file, v1 total_inactive_file), less its dirty and writeback pages when those are listed, and never
+// more than the group's charged usage.  active_file (it holds mlocked pages) and shmem (pinned complements, the KV
+// pool) are not credited.  A memory.stat that is missing or unparsable gives no credit - not an unknown sample.
+uint64_t reclaimable_cache(const fs::path& dir, uint64_t current, bool v1) {
+    std::ifstream stat(dir / "memory.stat");
+    if (!stat) return 0;
+    const char* inactive_key = v1 ? "total_inactive_file" : "inactive_file";
+    const char* dirty_key = v1 ? "total_dirty" : "file_dirty";
+    const char* writeback_key = v1 ? "total_writeback" : "file_writeback";
+    std::optional<uint64_t> inactive;
+    uint64_t dirty = 0, writeback = 0;
+    std::string line;
+    while (std::getline(stat, line)) {
+        std::istringstream fields(line);
+        std::string key, value, extra;
+        if (!(fields >> key >> value) || (fields >> extra)) continue;
+        uint64_t* target = key == dirty_key ? &dirty : key == writeback_key ? &writeback : nullptr;
+        uint64_t n = 0;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), n);
+        const bool ok = parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+        if (key == inactive_key) { if (!ok || inactive) return 0; inactive = n; }
+        else if (target != nullptr) { if (!ok) return 0; *target = n; }
+    }
+    if (!inactive) return 0;
+    uint64_t credit = std::min(*inactive, current);
+    credit = dirty >= credit ? 0 : credit - dirty;
+    credit = writeback >= credit ? 0 : credit - writeback;
+    return credit;
+}
+
+// What the cgroup files say: every finite limit with the usage charged against it (and the cache credit of that
+// group), and the usage and credit of the topmost visible group (the root of this namespace - what a container's own
+// limit is measured over).
 struct CgroupScan {
-    struct Limit { uint64_t limit, current; };
+    struct Limit { uint64_t limit, current, credit; };
     std::vector<Limit> limits;
     std::optional<uint64_t> root_current;
+    uint64_t root_credit = 0;
     bool any_files = false;
 };
 
@@ -99,11 +133,12 @@ bool scan_levels(const std::vector<fs::path>& dirs, const char* const* limit_nam
             continue;                          // no memory controller at this level (e.g. the host's root group)
         }
         out.any_files = true;
-        if (i == 0) out.root_current = current.n;
+        const uint64_t credit = reclaimable_cache(dirs[i], current.n, v1);
+        if (i == 0) { out.root_current = current.n; out.root_credit = credit; }
         for (const Value& v : limits) {
             if (v.kind != Value::number) continue;
             if (v1 && v.n >= (1ull << 62)) continue;   // v1's "unlimited" is a number near 2^63
-            out.limits.push_back({v.n, current.n});
+            out.limits.push_back({v.n, current.n, credit});
         }
     }
     return true;
@@ -174,25 +209,29 @@ std::optional<HostMemoryReading> combine(std::optional<uint64_t> available, std:
     r.limit = total.value_or(0);
     r.current = total && *total >= *available ? *total - *available : 0;
     for (const CgroupScan::Limit& l : cg.limits) {
-        const uint64_t room = l.limit > l.current ? l.limit - l.current : 0;
+        const uint64_t used = l.current - l.credit;   // credit <= current
+        const uint64_t room = l.limit > used ? l.limit - used : 0;
         if (room < r.available) {
             r.available = room;
             r.source = MemorySource::cgroup;
             r.limit = l.limit;
             r.current = l.current;
+            r.credit = l.credit;
         }
     }
     if (explicit_limit != 0) {
-        uint64_t used = 0;
-        if (cg.root_current) used = *cg.root_current;
+        uint64_t used = 0, credit = 0;
+        if (cg.root_current) { used = *cg.root_current; credit = cg.root_credit; }
         else if (total && *total >= *available) used = *total - *available;
         else return {};
-        const uint64_t room = explicit_limit > used ? explicit_limit - used : 0;
+        const uint64_t net = used - credit;
+        const uint64_t room = explicit_limit > net ? explicit_limit - net : 0;
         if (room <= r.available) {   // a tie goes to the operator's number: it is the one that names the real cap
             r.available = room;
             r.source = MemorySource::flag;
             r.limit = explicit_limit;
             r.current = used;
+            r.credit = credit;
         }
     }
     return r;
