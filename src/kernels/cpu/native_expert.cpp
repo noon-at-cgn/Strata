@@ -112,7 +112,6 @@ void native_set_kq_kernel(int mode) {
     kq_kernel_atomic().store(cpu_avx2_ok() && mode >= kKqGgml && mode <= kKqFast ? mode : (int) kKqGgml, std::memory_order_relaxed);
 }
 int native_kq_kernel() { return kq_kernel_atomic().load(std::memory_order_relaxed); }
-
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
