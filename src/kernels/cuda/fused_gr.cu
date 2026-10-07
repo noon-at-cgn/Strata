@@ -1311,7 +1311,7 @@ static bool fused_gr_read_multi_impl(const FusedGrArgs* a, int n_tok, float* xn_
             std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
             std::exit(1);
         }
-        return;
+        return false;   // the gfx906 STRATA_GR_SPLIT read: no q8_1 (the caller quantizes), like the v3 path above
     }
 #endif
 #if !defined(__HIPCC__)
