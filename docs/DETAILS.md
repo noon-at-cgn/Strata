@@ -426,7 +426,8 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
 
 **Tuning for your PC (`--calibrate`, engine 0.1.19).** Three engine settings depend on the PC more than on the model:
 - the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU
-  (`--pcie-frac`: a fast PCIe link and a slower CPU want more, a laptop's narrower link less);
+  (`--pcie-frac`: a fast PCIe link and a slower CPU want more, a laptop's narrower link less; `--pcie-balance`
+  chooses it per layer from measured costs instead, see [PCIE_BALANCE.md](PCIE_BALANCE.md));
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
 - how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster).
 
