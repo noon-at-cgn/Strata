@@ -293,9 +293,46 @@ These are always on; each replaces code that did the same job.
 - **A long read gives way by what is left to read, not by prompt length** (#656, #1288): the server's `BYIELD`
   decision counts only the tokens the engine still has to read ([BATCHING.md](BATCHING.md)).
 
+## Dense chain: the hyper-connection read (branch `w2-dense`)
+
+Two restart-time knobs for the GPU side of a decode window (the part before and after the experts: `hc-read0`,
+`hc-read1+router` in the profile). Both are read when the verify window's graph is captured, so **neither can be switched
+per request** (`strata_tune` has no key for them): changing one means a restart.
+
+| Knob | Default | Start-up setting | Per request | What it changes | Log line to read |
+| --- | --- | --- | --- | --- | --- |
+| `STRATA_HC_Q8` (existed, this branch audited it) | **off** | `STRATA_HC_Q8=1` | none (restart) | The verify window's hyper-connection read takes the GGUF's own Q8_0 `hc_*_down` / `hc_*_up` projections (and the final mixer's `output_hc_*`) instead of the pack's BF16 copy of them. **Output changes**: the pack's copy is each Q8_0 value (fp16 scale times int8, exact in fp32) rounded to BF16, which holds only about 1.6% of those values exactly and is off by up to 2^-8 on the rest (`hc_q8_numeric_test` prints the numbers), and the Q8_0 kernels sum a row in 640-column chunks, another order than the BF16 kernels. The Q8_0 read is the closer one to the file. Halves the bytes of this read (the file's 0.65 GiB against the pack's 1.20 GiB for all layers). Costs VRAM: the Q8_0 copy is kept beside the BF16 one (the prompt path still reads that): about 0.65 GiB for the whole model, half of it on each card of a layer split, taken out of the expert cache (the cache is sized after the dense weights are loaded). The inject rows stay BF16 (they are exact there, `STRATA_HC_Q8_INJECT=1` reads them as Q8_0 too). | start-up: `STRATA_HC_Q8=1: N GiB of Q8_0 hyper-connection projections for the verify read` |
+| `STRATA_HC_FUSED` | **off** | `STRATA_HC_FUSED=1` (with or without `STRATA_HC_Q8=1`) | none (restart) | Removes redundant work from the hyper-connection read and starts its last launch's weight loads earlier. **Bit for bit the same outputs** as the read it replaces (every task runs the same operations in the same order; `hc_q8_emu_test` proves it on the CPU for 1..8 rows, `hc_q8_parity` on the GPU, and every card re-checks it at start). Q8_0 read (two launches as before): the down launch's last chunk block of each row group reduces that group's 16 partial dots into `lo` / inject / `rs` (the old up kernel redid this in each of its 160 blocks), and the up launch requests its weights and inputs first and then reads the finished `lo`. BF16 read (three launches as before): the up launch requests all eight rows' weights and the epilogue inputs first (the old one asked for each row's weights when it got to the row). Neither waits for another block. The counters this needs (`FusedGrArgs::hc_sync`, 16 words per verifier, zero between launches) cost 64 bytes. At start every card runs `fused_gr_fused_check` (the BF16 form, and the Q8_0 form with `STRATA_HC_Q8=1`; random weights, 1..8 rows, with and without the pending write, each launched twice) and uses the form only if every output equals the plain read's bit for bit; the log says why when not. `STRATA_HC_FUSED_ONE_LAUNCH=1` (with `STRATA_HC_FUSED=1`) instead runs each read as **one launch** whose blocks wait for each other through the counters (a block takes its task from an atomic ticket as it starts, so tasks start in ascending order whatever order the GPU dispatches blocks in and no block waits for one that has not started; a wait over about 2 s traps instead of hanging; the BF16 form carries windows of up to 4 rows). **That one-launch form measured slower than the plain reads** on an RTX 3080 (T = 3 rows, a graph of 96 reads over 6 layers' weights: BF16 38 us per read plain, 57 us one launch; Q8_0 32 us plain, 40 us one launch; the blocks' dependent phases cost about 3 us per hand-off, and 128 registers per thread leave two blocks per SM so the 336 blocks run in waves), it is kept as an experiment. `STRATA_GR_V3=1`, `STRATA_NO_MULTI_GR=1` and `STRATA_HC_SPLIT=0|1` (the plain / split reads) keep the plain reads. Needs a compute capability 7.0 card or newer; HIP builds ignore it. | `strata hc: CUDA0: the STRATA_HC_FUSED Q8_0 read equals the plain read bit for bit on this card ...` then `STRATA_HC_FUSED=1: the hyper-connection read (Q8_0 projections) runs with its reduction folded into the down launch ...`; in the profile (`STRATA_DECODE_TIMING=1 STRATA_VERIFY_PROFILE=1`) the `hc-read0` column of the GDN layers (shown split as `hc0 norm` / `hc0 down` / `hc0 up` for the multi-launch read) and `hc-read1+router` |
+
+A restart A/B of the four combinations is `STRATA_HC_Q8` x `STRATA_HC_FUSED`; the two cells with `STRATA_HC_Q8=0`
+(fused or not) have the same outputs, so tokens can be compared exactly; the cells with `STRATA_HC_Q8=1` have the
+Q8_0 read's outputs with or without the fusion (those two also agree bit for bit).
+
+Other switches that already exist in this tree and touch the same chain, found while auditing (not changed here, off by
+default on CUDA; their authors report them bit-identical, measured on an AMD Strix Halo only): `STRATA_QFUSE=1` (the
+`q8_1` activation images written by the hyper-connection read and the GDN output norm instead of separate quantize
+launches), `STRATA_Q8_PACKED=1` (a second, repacked copy of the Q8_0 attention / GDN projections for the decode
+GEMVs: it costs about as much VRAM as those projections take), `STRATA_GDN_SPLIT=1`, `STRATA_TSUM=1`,
+`STRATA_MMVF_ROWS=1`. `gr_parity --selftest` checks `STRATA_QFUSE`'s hyper-connection part, `mmvq_multi_parity`
+the packed layout.
+
+Tests (none needs a model):
+
+- `hc_q8_numeric_test` (CPU): the Q8_0 versus BF16 weights, over every (fp16 scale, int8) pair and on real-shaped blocks.
+- `hc_q8_emu_test` (CPU, about 4 minutes): the production device code of both reads run on the CPU by
+  `tests/cuda_emu/cuda_emu.hpp` (every CUDA thread a fiber, blocks dispatched in a chosen order with a chosen number
+  resident). Checks the existing Q8_0 read against a double-precision reference built from the raw Q8_0 bytes, and both
+  one-launch reads bit for bit against the multi-launch reads, for 1..8 rows, with and without the pending write, with
+  the `q8_1` image, under ascending, descending and shuffled dispatch down to one resident block; and that a ticketless
+  version of the Q8_0 kernel does hang there. It cannot show timing, memory-ordering or the GPU's `exp`.
+- `hc_q8_parity` (GPU, a few seconds, about 25 MiB of buffers plus the CUDA context): the same checks on the card, through
+  CUDA graphs replayed with new inputs, with another kernel holding 56 KiB of every SM; `hc_q8_parity --bench [rows]`
+  times the BF16 read, the Q8_0 read and the one-launch Q8_0 read in a graph of 96 reads the way a window runs them
+  (about 150 MiB).
+
 ## What this file does not claim
 
-No knob above has a measured effect on tokens per second, latency or hit rate in this document. `--batch-overlap` is
+No knob above (the dense-chain ones included: nothing was timed on a GPU for them) has a measured effect on tokens per second, latency or hit rate in this document. `--batch-overlap` is
 marked "not measured yet on GPUs" in BATCHING.md; `--pcie-balance`'s link cost is a DMA probe, while the default
 `--pcie-mode auto` stages the share with a copy kernel inside the window's graph, so the probe can differ from the
 in-window cost (bound the share with `pcie_frac` if so, see the Limits section of [PCIE_BALANCE.md](PCIE_BALANCE.md)).
