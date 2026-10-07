@@ -7911,6 +7911,7 @@ int main(int argc, char** argv) {
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
         std::vector<double> bt_stage_wait0, bt_stage_pool0;
+        std::vector<strata::core::DoorLatency> bt_door0;   // the doorbell histograms when the burst started
         int64_t bt_cpu_ent0 = 0, bt_off_ent0 = 0;
         // the adaptive VRAM tier in batch windows: windows seen since the engine started (--adapt-every counts them), and,
         // since the last timing line, its rounds, the experts it swapped in and the ms a window waited for it
@@ -8203,6 +8204,8 @@ int main(int argc, char** argv) {
                     bt_stage_wait0[k] = stage_verifier((int) k).ms_wait;
                     bt_stage_pool0[k] = stage_verifier((int) k).ms_pool;
                 }
+                bt_door0.clear();
+                for (size_t k = 0; k <= stages.size(); ++k) bt_door0.push_back(stage_verifier((int) k).door_lat);
                 bt_cpu_ent0 = drive.d.multi_entries; bt_off_ent0 = drive.d.offload_entries;
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
@@ -8394,6 +8397,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: --batch-overlap %s (the commits of all stages launched before one sync%s)\n",
                              strata::core::Verifier::batch_overlap() ? "ON" : "off",
                              batch_mtp ? ", the slot drafts launched back to back" : "");
+                if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
+                    for (size_t k = 0; k <= stages.size() && k < bt_door0.size(); ++k)   // doorbell -> flag A, this burst's layers
+                        std::fprintf(stderr, "strata batch: stage %zu doorbell -> flag A: %s\n", k + 1,
+                                     strata::core::DoorLatency::describe(stage_verifier((int) k).door_lat.since(bt_door0[k])).c_str());
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
@@ -9750,6 +9757,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: aux cpus %s for this request%s\n", strata::aux_cpus::enabled() ? "ON" : "off",
                                  want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
             }
+            std::vector<strata::core::DoorLatency> door0;   // the doorbell histograms at this request's start (STRATA_SPLIT_TIMING)
+            for (int st = 0; st < n_stages; ++st) door0.push_back(stage_ver(st).door_lat);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // --pcie-balance (flag, env or this request's key): per stage, the link's DMA cost is measured between
             // windows (here, now, when it has never been or the last reading is over a minute old) and the pool's
@@ -11058,6 +11067,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: stage %d: %lld windows; per window: wait for the GPU %.3f ms, "
                                          "pool + plan %.3f ms, host staging %.3f ms, commit %.3f ms\n", st,
                                  (long long) v.windows, v.ms_wait / w, v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
+                    // this request's layers: from the host seeing the layer's doorbell to flag A going up (door_latency.hpp)
+                    if ((size_t) st < door0.size())
+                        std::fprintf(stderr, "strata serve: stage %d: doorbell -> flag A, this request: %s\n", st,
+                                     strata::core::DoorLatency::describe(v.door_lat.since(door0[(size_t) st])).c_str());
                 }
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM

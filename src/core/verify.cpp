@@ -1797,6 +1797,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
         const Clock::time_point b = Clock::now();
+        door_seen(b);
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);
         cur_layer_ = want - 1;
@@ -1822,6 +1823,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
+            flag_a_raised();
             raise_flag(h_flagB_, want);
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
@@ -2004,6 +2006,7 @@ void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
     _mm_sfence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+    v->flag_a_raised();
 }
 
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
@@ -2474,6 +2477,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             }
         }
         const Clock::time_point b = Clock::now();
+        door_seen(b);
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
@@ -2489,6 +2493,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
+            flag_a_raised();
             raise_flag(h_flagB_, want);
         }
         *flag = want;
@@ -2661,6 +2666,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             return 0;
         }
         const Clock::time_point b = Clock::now();
+        door_seen(b);
         cur_layer_ = want - 1;
         set_plan_slot(0);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
@@ -2675,6 +2681,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
+            flag_a_raised();
             raise_flag(h_flagB_, want);
         }
         *(volatile uint32_t*) h_flag_ = want;
@@ -2880,6 +2887,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err, int max_la
             return 0;
         }
         const Clock::time_point b = Clock::now();
+        door_seen(b);
         ms_wait += now_ms() - fl_since_ms_;
         const int grp = (int) (fl_k_ % G);
         cur_layer_ = want - 1;
@@ -2902,6 +2910,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err, int max_la
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
+            flag_a_raised();
             raise_flag(h_flagB_, want);
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
