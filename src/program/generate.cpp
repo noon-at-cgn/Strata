@@ -58,6 +58,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/program/vision_records.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/message_boundary.hpp"
@@ -3561,6 +3562,9 @@ int main(int argc, char** argv) {
                      (double) kv_pool.pinned_bytes() / 1073741824.0);
     }
 
+    // Separate from the foreground admission table. Slot graphs keep these addresses across reuse.
+    std::vector<std::vector<std::shared_ptr<int32_t>>> bslot_mrope;
+
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
@@ -3604,6 +3608,7 @@ int main(int argc, char** argv) {
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
+        bslot_mrope.resize(bslot_ss.size());
         int fit = o.batch;   // the slots every stage could carve
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -3618,6 +3623,26 @@ int main(int argc, char** argv) {
             const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, rope != nullptr);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
+                std::shared_ptr<int32_t> positions_owner;
+                if (o.vision) {
+                    int32_t* positions = nullptr;
+                    if (cudaMalloc(&positions, mrope_host.size() * sizeof(int32_t)) != cudaSuccess) {
+                        std::fprintf(stderr, "strata generate: --batch: slot %d's image positions do not fit on CUDA%d\n", b, dev);
+                        cudaGetLastError();
+                        fit = b;
+                        break;
+                    }
+                    positions_owner = std::shared_ptr<int32_t>(positions, [dev](int32_t* p) {
+                        const strata::core::OnDevice on(dev);
+                        cudaFree(p);
+                    });
+                    if (cudaMemcpy(positions, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        std::fprintf(stderr, "strata generate: --batch: slot %d's image position initialization failed on CUDA%d\n", b, dev);
+                        cudaGetLastError();
+                        fit = b;
+                        break;
+                    }
+                }
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
                 if (cudaMalloc(&buf, bytes) != cudaSuccess ||
@@ -3637,6 +3662,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata generate: --batch: slot %d: %s\n", b, err.c_str());
                     return 1;
                 }
+                if (positions_owner) {
+                    u->mrope = positions_owner.get();
+                    bslot_mrope[k].push_back(std::move(positions_owner));
+                }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
             }
@@ -3646,6 +3675,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
+        for (auto& v : bslot_mrope) if ((int) v.size() > fit) v.resize((size_t) fit);
         for (auto& v : bslot_ss)   // the same count on every stage; a dropped session leaves the pool's lanes
             if ((int) v.size() > fit) {
                 for (size_t b = (size_t) fit; b < v.size(); ++b) kv_pool.detach(*v[b]);
@@ -3656,6 +3686,7 @@ int main(int argc, char** argv) {
                                  "--max-context or KV streaming, --kv-resident, makes them smaller)\n");
             for (auto& v : bslot_ss) for (auto& u : v) kv_pool.detach(*u);
             bslot_ss.clear();
+            bslot_mrope.clear();
             o.batch = 0;
         } else {
             o.batch = fit;
@@ -3664,6 +3695,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
                                  "expert cache would otherwise hold\n", o.batch,
                          (double) bytes0 * o.batch / 1073741824.0);
+            if (o.vision)   // each slot's image-position table, on every stage's GPU (carved above, so the cache is sized without them)
+                std::fprintf(stderr, "strata generate: --batch %d --vision: %d per-slot image-position tables of %.2f MiB "
+                                     "on each stage GPU (%.2f MiB per GPU), taken from the expert cache's VRAM\n", o.batch,
+                             o.batch, (double) (mrope_host.size() * sizeof(int32_t)) / 1048576.0,
+                             (double) (mrope_host.size() * sizeof(int32_t) * (size_t) o.batch) / 1048576.0);
         }
     }
 
@@ -7737,6 +7773,12 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                if (to.mrope != nullptr && cudaMemcpy(const_cast<int32_t*>(to.mrope),
+                    k == 0 ? d_mrope : stages[k - 1]->mrope, mrope_host.size() * sizeof(int32_t),
+                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
+                    e = "batch admission: image position copy failed";
+                    return false;
+                }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
@@ -7944,6 +7986,28 @@ int main(int argc, char** argv) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
+            // --batch-overlap: the slot drafts are launched one after another (each drafter's graphs wait for the previous
+            // drafter's, so they still run in turn on the GPU) and collected together once all are launched, instead of
+            // each one waiting for its own to finish before the next starts.
+            const bool overlap_drafts = batch_mtp && strata::core::Verifier::batch_overlap();
+            int pending_draft[strata::kernels::kVerifyMaxT] = {};
+            int n_pending_draft = 0;
+            cudaEvent_t prev_draft = nullptr;
+            auto collect_drafts = [&]() -> bool {
+                bool ok = true;
+                for (int i = 0; i < n_pending_draft; ++i) {
+                    const int b = pending_draft[i];
+                    std::string de;
+                    if (slot_mtp[(size_t) b]->draft_end(bs[(size_t) b].draft.data(), de)) {
+                        bs[(size_t) b].draft_ready = true;
+                    } else if (ok) {
+                        std::printf("ERR batch MTP slot %d: %s\n", b, de.c_str());
+                        ok = false;
+                    }
+                }
+                n_pending_draft = 0;
+                return ok;
+            };
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -7973,17 +8037,33 @@ int main(int argc, char** argv) {
                     // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
                     const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
-                                        ver.final_R_all() + (size_t) first[t] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
-                                        slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
-                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
-                        return false;
+                    const bool copied = cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                                        ver.final_R_all() + (size_t) first[t] * stride,
+                                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                                        slot_mtp[(size_t) b]->stream()) == cudaSuccess;
+                    if (overlap_drafts) {   // --batch-overlap: launched now, collected after the loop
+                        if (!copied ||
+                            !slot_mtp[(size_t) b]->draft_begin(2, outb + first[t], pos[first[t]], keep[b] - 1, err, prev_draft)) {
+                            if (!copied) err = "the residual rows' copy to the drafter failed";
+                            (void) collect_drafts();   // nothing may run on behind the error
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        prev_draft = slot_mtp[(size_t) b]->done_event();
+                        pending_draft[n_pending_draft++] = b;
+                    } else {
+                        if (!copied || !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                                    sl.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        sl.draft_ready = true;
                     }
-                    sl.draft_ready = true;
                 }
+            }
+            if (overlap_drafts) {
+                std::fflush(stdout);   // the tokens leave while the drafts run
+                if (!collect_drafts()) return false;
             }
             pool_report();
             std::fflush(stdout);
@@ -8043,6 +8123,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
+                std::fprintf(stderr, "strata batch: --batch-overlap %s (the commits of all stages launched before one sync%s)\n",
+                             strata::core::Verifier::batch_overlap() ? "ON" : "off",
+                             batch_mtp ? ", the slot drafts launched back to back" : "");
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
@@ -8152,7 +8235,7 @@ int main(int argc, char** argv) {
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
-                const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+                const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
                 std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
                                      "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                              (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
@@ -8483,6 +8566,8 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            int req_q8k_avx2 = -1;   // q8k_avx2=0|1: the CPU experts' Q8_K activation quantizer (same bytes; -1 = the start-up value)
+            int req_batch_overlap = -1;   // batch_overlap=0|1: --batch-overlap for the batch windows (-1 = the start-up value)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8508,6 +8593,8 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "q8k_avx2") req_q8k_avx2 = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "batch_overlap") req_batch_overlap = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -8524,6 +8611,11 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (n < 1 || n > o.max_context - 8 || max_new > o.max_context - n - 8) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                            (long long) max_new, (long long) o.max_context);
+                continue;
+            }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -8539,33 +8631,14 @@ int main(int argc, char** argv) {
                 if (!geni) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                 } else {
-                    struct Img { int64_t n, nx, ny; size_t off; };
-                    std::vector<Img> imgs;
-                    img_rows.clear();
-                    std::FILE* f = std::fopen(emb_path.c_str(), "rb");
-                    if (!f) ve = "cannot open " + emb_path;
-                    while (f && ve.empty()) {
-                        int32_t hdr[5];
-                        const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
-                        if (got == 0) break;
-                        if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
-                            (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
-                            ve = "bad embeddings file (expected strata-vision records of width " +
-                                 std::to_string((long long) g.n_embd) + ")";
-                            break;
-                        }
-                        const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
-                        img_rows.resize(off + cnt);
-                        if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
-                        imgs.push_back({hdr[1], hdr[2], hdr[3], off});
-                    }
-                    if (f) std::fclose(f);
+                    std::vector<strata::program::VisionRecord> imgs;
+                    strata::program::read_vision_records(emb_path, g.n_embd, n, img_rows, imgs, ve);
                     int64_t p = 0, i = 0;
                     size_t k = 0;
                     while (ve.empty() && i < n) {
                         if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
                         if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
-                        const Img& im = imgs[k++];
+                        const strata::program::VisionRecord& im = imgs[k++];
                         {   // what the conversation cache compares: a picture is its grid and its embeddings
                             const int64_t grid[3] = {im.n, im.nx, im.ny};
                             uint64_t h = fnv1a(grid, sizeof grid);
@@ -8616,11 +8689,6 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
-            }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
@@ -9366,6 +9434,14 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            {   // q8k_avx2=: byte-identical either way; with batch slots the latest admitted request's value holds for the windows
+                static const bool q8k_start = strata::kernels::cpu::native_q8k_avx2();
+                strata::kernels::cpu::native_set_q8k_avx2(req_q8k_avx2 < 0 ? q8k_start : req_q8k_avx2 != 0);
+            }
+            if (o.batch > 0) {   // like pcie_frac, the latest admitted request's value holds for the batch windows after it
+                static const bool overlap_start = strata::core::Verifier::batch_overlap();
+                strata::core::Verifier::set_batch_overlap(req_batch_overlap < 0 ? overlap_start : req_batch_overlap != 0);
+            }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)

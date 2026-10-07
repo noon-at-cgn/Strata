@@ -38,6 +38,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
+/// The AVX-2 Q8_K activation quantizer (byte-identical to ggml-cpu's scalar one) on or off for every later call; the
+/// start-up value is on where the CPU has AVX2 unless STRATA_NO_Q8K_AVX2 is set.  Safe to flip at any time.
+void native_set_q8k_avx2(bool on);
+bool native_q8k_avx2();
 
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.
