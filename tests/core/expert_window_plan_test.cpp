@@ -13,6 +13,9 @@
 //   - out-of-range ids (planned, then refused by the pool loop later),
 //   - pcie_mode 0/1/2 (staging addresses vs device aliases),
 //   - per-slot cache offsets vs uniform slots.
+//   - --pcie-balance: the share chosen by PcieBalance::choose (cold = 0, warmed, with and without a measured busy
+//     pool cost) must equal what the reference planner gets from its own copy of the estimator, and be smaller than
+//     the floor rule when the pool is cheaper per expert than the link.
 #include "strata/core/expert_source.hpp"
 
 #include <cstdint>
