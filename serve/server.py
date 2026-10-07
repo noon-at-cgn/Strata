@@ -934,6 +934,11 @@ class StrataEngine:
             pb = tune.get("pcie_balance")
             if isinstance(pb, bool) or (isinstance(pb, (int, float)) and pb in (0, 1)):
                 keys += f" pcie_balance={int(pb)}"
+            # --pipeline-windows for this request: 0 decodes it serially, 2 in the pipelined loop (only when the engine was
+            # started with --pipeline-windows 2).  Whole numbers 0 and 2; anything else is not sent.
+            pw = tune.get("pipeline_windows")
+            if isinstance(pw, int) and not isinstance(pw, bool) and pw in (0, 2):
+                keys += f" pipeline_windows={pw}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

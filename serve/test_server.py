@@ -1265,6 +1265,14 @@ class SamplingKeys(unittest.TestCase):
             self.assertFalse([x for x in k if x.split("=")[0] == "prefill_pipe_k"], bad)
         self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("prefill_pipe_k")])
 
+    def test_pipeline_windows_key(self):
+        for val in (0, 2):
+            self.assertIn(f"pipeline_windows={val}", self.keys(temperature=0, strata_tune={"pipeline_windows": val}))
+        for bad in (1, 3, -1, 2.0, True, False, "2", None):
+            k = self.keys(strata_tune={"pipeline_windows": bad})
+            self.assertFalse([x for x in k if x.split("=")[0] == "pipeline_windows"], bad)
+        self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("pipeline_windows")])
+
     def test_tune_pcie_balance(self):
         for val, want in ((True, "pcie_balance=1"), (1, "pcie_balance=1"), (False, "pcie_balance=0"), (0, "pcie_balance=0"),
                           (1.0, "pcie_balance=1"), (0.0, "pcie_balance=0")):
