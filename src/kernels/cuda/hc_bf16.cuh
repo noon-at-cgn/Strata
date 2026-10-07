@@ -279,7 +279,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 constexpr int F1_MAX_T = 4;
 constexpr int SYNC_NORM = 2, SYNC_DOWN = 3;
 
-template <int T>
+// WAIT: a task of the one-launch read; false: the up launch (gr_up_pf_kernel) after the down launch finished
+template <int T, bool WAIT>
 __device__ __forceinline__ void gr_f1_up_task(const GrMulti& m, const unsigned* down_done, int u) {
     STRATA_SHARED(float, lo, [T][LR]);
     STRATA_SHARED(float, g, [T][HC][UPM_COLS]);
@@ -319,9 +320,9 @@ __device__ __forceinline__ void gr_f1_up_task(const GrMulti& m, const unsigned* 
         ipS[k][c] = m.a[k].apply ? m.a[k].inj_prev[c] : 0.0f;
     }
     // 3. the down phase done: every row of `lo` (and `rs`, from the norm phase) is written
-    if (t == 0) gr_wait_ge(down_done, (unsigned) (DOWN_BLOCKS + 1));
+    if (WAIT && t == 0) gr_wait_ge(down_done, (unsigned) (DOWN_BLOCKS + 1));
     __syncthreads();
-    __threadfence();
+    if (WAIT) __threadfence();
     for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = __ldcg(m.a[i / LR].lo + i % LR);
     if (t < T * HC) {
         const int k = t / HC, c = t - k * HC;
@@ -371,6 +372,13 @@ __device__ __forceinline__ void gr_f1_up_task(const GrMulti& m, const unsigned* 
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
+// The multi up read with its weights and epilogue inputs requested first (the original asks for each of a warp's 8 rows' weights
+// only when it gets to the row): bit for bit gr_up_multi_kernel<T, true>, no waiting (STRATA_HC_FUSED=1, BF16 projections).
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_up_pf_kernel(GrMulti m) {
+    gr_f1_up_task<T, false>(m, nullptr, (int) blockIdx.x);
+}
+
 template <int T>
 constexpr unsigned kF1Grid = (unsigned) (T * HC + (DOWN_BLOCKS + 1) + UPM_BLOCKS);   // blocks of gr_hc_fused_kernel<T>
 
@@ -386,7 +394,7 @@ __global__ void __launch_bounds__(THREADS) gr_hc_fused_kernel(GrMulti m, unsigne
     } else if (task < NNORM + NDOWN) {
         gr_down_staged_task<T, true, true>(m, (int) (task - NNORM), &sync_[SYNC_NORM], NNORM, &sync_[SYNC_DOWN]);
     } else {
-        gr_f1_up_task<T>(m, &sync_[SYNC_DOWN], (int) (task - NNORM - NDOWN));
+        gr_f1_up_task<T, true>(m, &sync_[SYNC_DOWN], (int) (task - NNORM - NDOWN));
     }
     gr_retire(sync_, kF1Grid<T>);
 }

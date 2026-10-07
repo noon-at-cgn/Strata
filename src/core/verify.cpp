@@ -67,7 +67,8 @@ inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::ge
 inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_QDEDUP"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
-// STRATA_HC_FUSED=1: the hyper-connection read (BF16 or, with STRATA_HC_Q8=1, Q8_0) as one launch (fused_gr.hpp: hc_sync)
+// STRATA_HC_FUSED=1: the hyper-connection read (BF16 or, with STRATA_HC_Q8=1, Q8_0) without redundant work and with its up weights
+// requested first; STRATA_HC_FUSED_ONE_LAUNCH=1 as one launch (fused_gr.hpp: hc_sync)
 inline bool g_hc_fused() { static const bool on = [] { const char* v = std::getenv("STRATA_HC_FUSED"); return v != nullptr && v[0] == '1'; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -611,7 +612,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
-    if (g_hc_fused()) {   // STRATA_HC_FUSED=1: the hyper-connection read as one launch; its block counters, zeroed once (each launch leaves them zero)
+    if (g_hc_fused()) {   // STRATA_HC_FUSED=1: the hyper-connection read's block counters, zeroed once (each launch leaves them zero)
         const char* q8 = std::getenv("STRATA_HC_Q8");
         const bool q8_on = q8 != nullptr && q8[0] == '1';
         int cc_major = 0;
@@ -628,12 +629,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             if (hcsync_) cudaFree(hcsync_);
             hcsync_ = nullptr;
             std::fprintf(stderr, "strata: STRATA_HC_FUSED=1: the counters could not be allocated: ignored\n");
-        } else if (!strata::kernels::fused_gr_fused_check(q8_on)) {
+        } else if (!strata::kernels::fused_gr_fused_check(false) || (q8_on && !strata::kernels::fused_gr_fused_check(true))) {   // both forms: a layer or the head may still read the BF16 pack
             cudaFree(hcsync_);
             hcsync_ = nullptr;   // (the check says why)
         } else {
-            std::fprintf(stderr, "strata: STRATA_HC_FUSED=1: the hyper-connection read (%s) runs as one launch\n",
-                         q8_on ? "Q8_0 projections" : "BF16 projections");
+            std::fprintf(stderr, "strata: STRATA_HC_FUSED=1: the hyper-connection read (%s) runs with its reduction folded into the "
+                                 "down launch and the up launch's weights requested first%s\n",
+                         q8_on ? "Q8_0 projections" : "BF16 projections",
+                         std::getenv("STRATA_HC_FUSED_ONE_LAUNCH") != nullptr ? " (STRATA_HC_FUSED_ONE_LAUNCH set: one launch)" : "");
         }
     }
     if (all_resident_ || device_plan_) {

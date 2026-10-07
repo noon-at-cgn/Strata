@@ -215,7 +215,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_kernel(GrMulti m, const floa
 }
 
 #if !defined(__HIPCC__)
-// ================================ STRATA_HC_Q8_FUSED=1: the same read in ONE launch =====================================
+// ================================ STRATA_HC_FUSED=1: the same read in ONE launch =====================================
 // gr_down_q8_kernel -> gr_up_q8_kernel is two launches with the up kernel redoing, in each of its 160 blocks, the reduction of
 // every row's 16 partial dots (the 324 x T lo / inject values: ~3 MB x T of L2 reads) before it can start on its own weights,
 // and with its weights only requested after that.  This kernel runs both phases as tasks of one grid and computes every
@@ -238,6 +238,9 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_kernel(GrMulti m, const floa
 //
 // Read-after-write across blocks: data is written, __threadfence()d, then published with an atomic; a reader that has seen the
 // count fences, and reads with __ldcg (through L2, never a stale L1 line).
+#ifndef STRATA_TRACE
+#define STRATA_TRACE(task, slot) ((void) 0)   // a probe build records %globaltimer per task and phase
+#endif
 constexpr int Q8_NRG = Q8_RG + 1;                  // 11 row groups: 10 of 32 down rows, and the inject rows
 constexpr int Q8F_DOWN = Q8_NRG * Q8_NKC;          // 176 down tasks
 constexpr int Q8F_UP = UPM_BLOCKS;                 // 160 up tasks
@@ -245,7 +248,8 @@ constexpr int Q8F_GRID = Q8F_DOWN + Q8F_UP;        // 336 blocks
 constexpr int SYNC_READY = 2, SYNC_RG = 3;   // sync_[SYNC_RG + row group]; (SYNC_TICKET, SYNC_DONE: fused_gr_common.cuh)
 static_assert(SYNC_RG + Q8_NRG <= kFusedGrSyncWords, "the counters fit the words the caller allocates");
 
-template <int T>
+// COUNT_READY: the one-launch read, whose up tasks wait for all 11 row groups; false: a launch of its own (gr_q8_down_red_kernel)
+template <int T, bool COUNT_READY>
 __device__ __forceinline__ void gr_q8f_down(const GrMulti& m, float* __restrict__ part, float* __restrict__ ssg,
                                             unsigned* sync_, int rg, int kc) {
     STRATA_SHARED(float, xs, [T][Q8_KC]);
@@ -297,6 +301,7 @@ __device__ __forceinline__ void gr_q8f_down(const GrMulti& m, float* __restrict_
         if (lane == 0) red[warp][k] = v;
     }
     __syncthreads();
+    STRATA_TRACE(kc * Q8_NRG + rg, 1);
     if (t < T) {   // the chunk's sum of squares: every row group keeps its own copy (the same bits in all of them)
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w) s += red[w][t];
@@ -336,11 +341,13 @@ __device__ __forceinline__ void gr_q8f_down(const GrMulti& m, float* __restrict_
         }
     }
     // publish this chunk; the last chunk of the row group reduces the group's rows
+    STRATA_TRACE(kc * Q8_NRG + rg, 2);
     __threadfence();
     __syncthreads();
     if (t == 0) last = atomicAdd(&sync_[SYNC_RG + rg], 1u) == (unsigned) (Q8_NKC - 1);
     __syncthreads();
     if (!last) return;
+    if (t == 0) atomicExch(&sync_[SYNC_RG + rg], 0u);   // every chunk of the group has arrived: ready for the next launch
     __threadfence();
     const int nr = inj ? HC : WARPS * Q8_RPW;
     const int prow0 = inj ? LR : rg * (WARPS * Q8_RPW);
@@ -379,10 +386,12 @@ __device__ __forceinline__ void gr_q8f_down(const GrMulti& m, float* __restrict_
     }
     __threadfence();
     __syncthreads();
-    if (t == 0) atomicAdd(&sync_[SYNC_READY], 1u);
+    STRATA_TRACE(kc * Q8_NRG + rg, 3);
+    if (COUNT_READY && t == 0) atomicAdd(&sync_[SYNC_READY], 1u);
 }
 
-template <int T>
+// WAIT: a task of the one-launch read; false: the up launch (gr_q8_up_pf_kernel) after the down launch finished
+template <int T, bool WAIT>
 __device__ __forceinline__ void gr_q8f_up(const GrMulti& m, const unsigned* sync_, int u) {
     STRATA_SHARED(float, lo, [T][LR]);
     STRATA_SHARED(float, rsS, [T][HC]);
@@ -431,9 +440,10 @@ __device__ __forceinline__ void gr_q8f_up(const GrMulti& m, const unsigned* sync
         ipS[k][c] = m.a[k].apply ? m.a[k].inj_prev[c] : 0.0f;
     }
     // 3. the down phase done: every row group reduced
-    if (t == 0) gr_wait_ge(sync_ + SYNC_READY, (unsigned) Q8_NRG);
+    STRATA_TRACE(Q8F_DOWN + u, 1);
+    if (WAIT && t == 0) gr_wait_ge(sync_ + SYNC_READY, (unsigned) Q8_NRG);
     __syncthreads();
-    __threadfence();
+    if (WAIT) __threadfence();
     for (int i = t; i < T * LR; i += THREADS) {
         const int k = i / LR, j = i - k * LR;
         lo[k][j] = __ldcg(m.a[k].lo + j);
@@ -443,6 +453,7 @@ __device__ __forceinline__ void gr_q8f_up(const GrMulti& m, const unsigned* sync
         rsS[k][c] = __ldcg(m.a[k].rs + c);
     }
     __syncthreads();
+    STRATA_TRACE(Q8F_DOWN + u, 2);
 #pragma unroll
     for (int qq = 0; qq < RPW8; ++qq) {
         const int r = warp + qq * WARPS;
@@ -494,18 +505,35 @@ __device__ __forceinline__ void gr_q8f_up(const GrMulti& m, const unsigned* sync
         for (int c = 0; c < HC; ++c) sum += g[k][c][col];
         m.a[k].mixed[d0 + col] = sum / (float) HC;
     }
+    STRATA_TRACE(Q8F_DOWN + u, 3);
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
 // (THREADS, 2): the down task keeps its 40 weight registers in flight (128 registers in all, no spills at any T; ptxas on
 // sm_86); asking for 3 blocks per SM (85 registers) spills 170-250 bytes per thread, so the grid (336 blocks) runs as
 // 136 resident blocks and the rest as those finish.  The ticket order below makes that safe.
+#ifndef STRATA_HC_FUSED_MINB
+#define STRATA_HC_FUSED_MINB 2
+#endif
 template <int T>
-__global__ void __launch_bounds__(THREADS, 2) gr_q8_fused_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg,
+__global__ void __launch_bounds__(THREADS, STRATA_HC_FUSED_MINB) gr_q8_fused_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg,
                                                                  unsigned* sync_) {
     const unsigned task = gr_take_ticket(sync_);
-    if (task < (unsigned) Q8F_DOWN) gr_q8f_down<T>(m, part, ssg, sync_, (int) (task % Q8_NRG), (int) (task / Q8_NRG));
-    else gr_q8f_up<T>(m, sync_, (int) (task - Q8F_DOWN));
+    STRATA_TRACE((int) task, 0);
+    if (task < (unsigned) Q8F_DOWN) gr_q8f_down<T, true>(m, part, ssg, sync_, (int) (task % Q8_NRG), (int) (task / Q8_NRG));
+    else gr_q8f_up<T, true>(m, sync_, (int) (task - Q8F_DOWN));
     gr_retire(sync_, (unsigned) Q8F_GRID);
+}
+// ---- the same two phases as two launches with no block waiting for another (STRATA_HC_FUSED=1): the down launch's last chunk
+// block of each row group does the group's reduction (what the old up kernel redid in all 160 blocks), the up launch requests
+// its weights and inputs first and then reads the finished lo.  Bit for bit gr_down_q8_kernel + gr_up_q8_kernel.
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_q8_down_red_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg,
+                                                                 unsigned* sync_) {
+    gr_q8f_down<T, false>(m, part, ssg, sync_, (int) blockIdx.x, (int) blockIdx.y);
+}
+template <int T>
+__global__ void __launch_bounds__(THREADS) gr_q8_up_pf_kernel(GrMulti m) {
+    gr_q8f_up<T, false>(m, nullptr, (int) blockIdx.x);
 }
 #endif   // !__HIPCC__
