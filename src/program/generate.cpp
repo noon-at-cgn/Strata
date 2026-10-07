@@ -554,6 +554,9 @@ struct Options {
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
+    /// --pcie-balance / STRATA_PCIE_BALANCE=1: choose each layer's PCIe share from the measured pool and link costs
+    /// (--pcie-frac becomes the upper bound); a request's `pcie_balance` key switches it for that request.
+    bool pcie_balance = false;
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
@@ -747,6 +750,10 @@ void usage() {
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
                  "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
+                 "  --pcie-balance       --serve (opt-in, also STRATA_PCIE_BALANCE=1): choose each layer's PCIe share of the\n"
+                 "                       missed experts from the measured pool and link costs instead of a fixed fraction;\n"
+                 "                       --pcie-frac is then the upper bound (0 = never). A request's strata_tune\n"
+                 "                       pcie_balance 0/1 switches it for that request (docs/PCIE_BALANCE.md)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -994,6 +1001,7 @@ struct SplitDrive {
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
+    strata::core::PcieBalance* balance[kMax] = {};   ///< each stage's own link and pool costs (--pcie-balance)
 };
 void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
@@ -1005,6 +1013,7 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
+    d.d.balance = s->balance[st];
     drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
 }
 
@@ -1529,6 +1538,22 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// --pcie-balance's costs of one stage for the log, in ms per expert (the stage's typical blob): the pool's cost with
+// nothing read over PCIe (and with some, once measured) and the DMA cost of the link.
+std::string pcie_balance_text(const strata::core::PcieBalance& pb, int dev) {
+    char b[160];
+    const double mib = pb.ref_mib;
+    if (pb.pcie_ms_per_mib() <= 0.0 || pb.cpu_idle_ms_per_mib() <= 0.0)
+        std::snprintf(b, sizeof b, "CUDA%d not measured yet", dev);
+    else if (pb.cpu_busy_ms_per_mib() > 0.0)
+        std::snprintf(b, sizeof b, "CUDA%d t_cpu %.3f (%.3f while the GPU reads) / t_pcie %.3f", dev,
+                      pb.cpu_idle_ms_per_mib() * mib, pb.cpu_busy_ms_per_mib() * mib, pb.pcie_ms_per_mib() * mib);
+    else
+        std::snprintf(b, sizeof b, "CUDA%d t_cpu %.3f / t_pcie %.3f", dev, pb.cpu_idle_ms_per_mib() * mib,
+                      pb.pcie_ms_per_mib() * mib);
+    return b;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1723,6 +1748,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
+        else if (a == "--pcie-balance") o.pcie_balance = true;
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
@@ -6246,6 +6272,8 @@ int main(int argc, char** argv) {
         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
         strata::core::Verifier ver_b;
         SplitDrive split_drive_b;
+        // --pcie-balance: each stage's own link and pool costs (the two cards' links differ); `enabled` per request
+        std::array<strata::core::PcieBalance, SplitDrive::kMax> pcie_bal;
         cudaStream_t pl_stream[2] = {nullptr, nullptr};
         if (pipe) {
             bool ok_p = cudaStreamCreateWithFlags(&pl_stream[0], cudaStreamNonBlocking) == cudaSuccess;
@@ -6285,6 +6313,7 @@ int main(int argc, char** argv) {
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
+                split_drive.balance[st] = &pcie_bal[(size_t) st];
             }
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
@@ -6910,6 +6939,40 @@ int main(int argc, char** argv) {
         }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.balance = &pcie_bal[0];   // a layer split sets its stage's own in drive_pool_split
+        for (int st = 0; st < n_stages && st < (int) pcie_bal.size(); ++st)
+            pcie_bal[(size_t) st].ref_mib = (double) strata::kernels::cpu::expert_layout().blob_bytes(
+                st == 0 ? 0 : stages[(size_t) st - 1]->lb) / 1048576.0;
+        // --pcie-balance (flag or STRATA_PCIE_BALANCE=1; a request's pcie_balance key beats both)
+        const bool pcie_balance_default = [&] {
+            const char* e = std::getenv("STRATA_PCIE_BALANCE");
+            return o.pcie_balance || (e != nullptr && e[0] != '\0' && e[0] != '0');
+        }();
+        std::array<std::optional<Clock::time_point>, SplitDrive::kMax> pcie_probed_at;
+        // The DMA cost of stage `st`'s link, ms per MiB: a few pinned expert blobs of one of its layers copied into the
+        // stage's own staging area (no new memory), between windows.  <= 0 with `perr` when it cannot be measured.
+        auto probe_stage_link = [&](int st, std::string& perr) -> double {
+            strata::core::ExpertSource* es = drive.d.src;
+            const int64_t lb = st == 0 ? 0 : stages[(size_t) st - 1]->lb;
+            const int64_t le = n_stages > 1 ? split_drive.end[st] : g.n_layers;
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            if (es == nullptr || le <= lb) { perr = "no expert source"; return -1.0; }
+            const uint8_t* blobs[8];
+            int nb = 0;
+            for (int64_t i = 0; i < le - lb && nb == 0; ++i) {
+                const int64_t layer = lb + ((le - lb) / 2 + i) % (le - lb);   // from the stage's middle layer on
+                if (!es->pcie_layer(layer)) continue;
+                for (int64_t j = 0; j < g.n_expert && nb < 8; ++j) {
+                    const int64_t e = (j * 61 + 7) % g.n_expert;
+                    if (!es->pinned(layer, e)) continue;
+                    if (const uint8_t* b = es->blob(layer, e)) blobs[nb++] = b;
+                }
+                if (nb < 4) nb = 0;   // too few pinned blobs here: try the next layer
+                else return stage_ver(st).probe_pcie_ms_per_mib(blobs, nb, (size_t) lay.blob_bytes(layer), 3, perr);
+            }
+            perr = "no pinned expert blobs to copy";
+            return -1.0;
+        };
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
@@ -8104,6 +8167,13 @@ int main(int argc, char** argv) {
                 else if (!drive.d.usage.empty())
                     std::snprintf(adapt_txt, sizeof adapt_txt, "; adaptive tier: %lld rounds, %lld experts swapped in",
                                   (long long) bt_adapt_rounds, (long long) bt_adapt_swaps);
+                std::string extra_txt = adapt_txt;   // the adaptive tier, then --pcie-balance's costs when it is on
+                if (pcie_bal[0].enabled) {
+                    extra_txt += "; pcie balance (ms per expert): ";
+                    for (size_t k = 0; k <= stages.size() && k < pcie_bal.size(); ++k)
+                        extra_txt += (k == 0 ? "" : ", ") +
+                                     pcie_balance_text(pcie_bal[k], k == 0 ? 0 : stages[k - 1]->dev);
+                }
                 std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f + adapt wait %.2f; per stage "
                                      "(ms/window): %s; per layer-window: CPU experts %.2f, VRAM hits %.2f, PCIe %.2f; routed "
@@ -8114,7 +8184,7 @@ int main(int argc, char** argv) {
                              bt_adapt_wait / w, per_stage.c_str(),
                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), e_vram / w, 100.0 * e_vram / e_all, e_pcie / w,
-                             100.0 * e_pcie / e_all, e_cpu / w, 100.0 * e_cpu / e_all, adapt_txt,
+                             100.0 * e_pcie / e_all, e_cpu / w, 100.0 * e_cpu / e_all, extra_txt.c_str(),
                              1000.0 * bt_rows / std::max(wall, 1e-9), wall);
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
@@ -8572,6 +8642,7 @@ int main(int argc, char** argv) {
             // prefill_pipe_k=N: how many prompt chunks a read beside decoding slots takes per pipeline run (a layer
             // split); 0 = not asked: STRATA_PREFILL_PIPE_K, else 1
             int req_pipe_k = 0;
+            int req_pcie_balance = -1;   // pcie_balance=0|1: the cost-balanced PCIe share for this request (-1: --pcie-balance)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -8596,6 +8667,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "pcie_balance") req_pcie_balance = fv >= 0.5f ? 1 : 0;
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "q8k_avx2") req_q8k_avx2 = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "batch_overlap") req_batch_overlap = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
@@ -9465,6 +9537,27 @@ int main(int argc, char** argv) {
                 strata::core::Verifier::set_batch_overlap(req_batch_overlap < 0 ? overlap_start : req_batch_overlap != 0);
             }
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            // --pcie-balance (flag, env or this request's key): per stage, the link's DMA cost is measured between
+            // windows (here, now, when it has never been or the last reading is over a minute old) and the pool's
+            // cost is measured on every layer; a stage whose link cannot be measured keeps the fixed share
+            const bool req_balance = req_pcie_balance >= 0 ? req_pcie_balance != 0 : pcie_balance_default;
+            int64_t bal_layers0[SplitDrive::kMax] = {}, bal_moved0[SplitDrive::kMax] = {};
+            for (int st = 0; st < n_stages && st < (int) pcie_bal.size(); ++st) {
+                strata::core::PcieBalance& pb = pcie_bal[(size_t) st];
+                pb.enabled = false;
+                bal_layers0[st] = pb.layers;
+                bal_moved0[st] = pb.moved;
+                if (!req_balance) continue;
+                const auto now_t = Clock::now();
+                if (!pcie_probed_at[(size_t) st] || now_t - *pcie_probed_at[(size_t) st] > std::chrono::seconds(60)) {
+                    std::string perr;
+                    const double pms = probe_stage_link(st, perr);
+                    if (pms > 0.0) { pb.set_pcie(pms); pcie_probed_at[(size_t) st] = now_t; }
+                    else std::fprintf(stderr, "strata serve: pcie balance, stage %d: link not measured (%s)%s\n", st, perr.c_str(),
+                                      pb.pcie_ms_per_mib() > 0.0 ? "; keeping the last reading" : "; the fixed share stays");
+                }
+                pb.enabled = pb.pcie_ms_per_mib() > 0.0;
+            }
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
@@ -10653,6 +10746,23 @@ int main(int argc, char** argv) {
                                      "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
                              src.gguf_mode() ? " (the GGUF in place)" : "");
+            // --pcie-balance: the share it realised this request and the costs it worked from, per stage
+            if (req_balance) {
+                std::string per;
+                int64_t lay_n = 0, moved_n = 0;
+                for (int st = 0; st < n_stages && st < (int) pcie_bal.size(); ++st) {
+                    const strata::core::PcieBalance& pb = pcie_bal[(size_t) st];
+                    lay_n += pb.layers - bal_layers0[st];
+                    moved_n += pb.moved - bal_moved0[st];
+                    if (st > 0) per += "; ";
+                    per += pb.enabled ? pcie_balance_text(pb, st == 0 ? 0 : stages[(size_t) st - 1]->dev)
+                                      : "stage " + std::to_string(st) + " on the fixed share";
+                }
+                std::fprintf(stderr, "strata serve: pcie balance: %.2f%% of the %lld routed entries went over PCIe (cap %.2f), "
+                                     "%lld experts chosen over %lld layers; ms per expert: %s\n",
+                             req_look + req_offload > 0 ? 100.0 * (double) req_offload / (double) (req_look + req_offload) : 0.0,
+                             (long long) (req_look + req_offload), req_pcie_frac, (long long) moved_n, (long long) lay_n, per.c_str());
+            }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)

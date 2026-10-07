@@ -1071,6 +1071,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(batch_rows_test tests/core/batch_rows_test.cpp)
   target_include_directories(batch_rows_test PRIVATE include)
   add_test(NAME batch_rows_test COMMAND batch_rows_test)
+  # --pcie-balance: the per-layer PCIe share from the pool's and the link's costs (header-only, CPU)
+  add_executable(pcie_balance_test tests/core/pcie_balance_test.cpp)
+  target_include_directories(pcie_balance_test PRIVATE include)
+  add_test(NAME pcie_balance_test COMMAND pcie_balance_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

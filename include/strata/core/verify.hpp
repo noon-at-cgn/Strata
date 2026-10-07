@@ -254,6 +254,10 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// --pcie-balance: the DMA time of one MiB of expert blob from host memory into this stage's staging area
+    /// (`n` <= 8 blobs of `bytes` each, the fastest of `reps` rounds after a warm-up), in ms; <= 0 with `err` set when
+    /// it cannot be measured.  Between windows only (no new memory: it reuses the window's own staging and copy stream).
+    double probe_pcie_ms_per_mib(const uint8_t* const* src, int n, size_t bytes, int reps, std::string& err);
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;

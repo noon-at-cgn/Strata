@@ -1929,6 +1929,7 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
         cur = prev;
     }
 #else
+    (void) f;   // only the Windows branch uses the volatile long view
     uint32_t cur = __atomic_load_n((uint32_t*) flag, __ATOMIC_SEQ_CST);
     while (cur < value && !__atomic_compare_exchange_n((uint32_t*) flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
 #endif
@@ -1963,6 +1964,36 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     fs.flag = v->h_flagB_;
     fs.value = want;
     cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+}
+
+double Verifier::probe_pcie_ms_per_mib(const uint8_t* const* src, int n, size_t bytes, int reps, std::string& err) {
+    const OnDevice on_device(device_);
+    if (staging_ == nullptr || copy_ == nullptr || src == nullptr || n < 1 || n > kStagingBlobs / 2 || reps < 1 ||
+        bytes == 0 || bytes > (size_t) strata::kernels::cpu::expert_layout().max_blob) {
+        err = "pcie probe: no staging area or bad arguments";
+        return -1.0;
+    }
+    if (b_running_ || fl_active_ || commit_pending_ || copy_used_ || released_.load()) {
+        err = "pcie probe: a window is in flight on this stage";
+        return -1.0;
+    }
+    cudaEvent_t t0 = nullptr, t1 = nullptr;
+    double best = -1.0;
+    bool ok = cudaEventCreate(&t0) == cudaSuccess && cudaEventCreate(&t1) == cudaSuccess;
+    for (int r = -1; ok && r < reps; ++r) {   // round -1 warms the path and is not counted
+        ok = cudaEventRecord(t0, copy_) == cudaSuccess;
+        for (int i = 0; ok && i < n; ++i)
+            ok = cudaMemcpyAsync(staging_ + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, copy_) == cudaSuccess;
+        ok = ok && cudaEventRecord(t1, copy_) == cudaSuccess && cudaEventSynchronize(t1) == cudaSuccess;
+        float ms = 0.0f;
+        ok = ok && cudaEventElapsedTime(&ms, t0, t1) == cudaSuccess;
+        if (ok && r >= 0 && ms > 0.0f) best = best < 0.0 ? (double) ms : std::min(best, (double) ms);
+    }
+    if (!ok) { err = "pcie probe: a CUDA call failed"; best = -1.0; (void) cudaGetLastError(); }
+    if (t0 != nullptr) cudaEventDestroy(t0);
+    if (t1 != nullptr) cudaEventDestroy(t1);
+    if (best <= 0.0) { if (err.empty()) err = "pcie probe: no time measured"; return -1.0; }
+    return best / ((double) n * (double) bytes / 1048576.0);
 }
 
 void Verifier::publish_plan(void* ctx) {

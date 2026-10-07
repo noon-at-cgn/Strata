@@ -26,6 +26,7 @@ namespace {
 using strata::core::GpuPlanSink;
 using strata::core::detail::WindowGpuPlanInput;
 using strata::core::detail::window_gpu_plan;
+using strata::core::PcieBalance;
 
 int g_fail = 0;
 void check(bool ok, const std::string& what) {
@@ -111,7 +112,7 @@ WindowGpuPlanInput make_input(const int32_t* ids, int64_t n, int64_t k, Stub& st
 // Verbatim from expert_pool_dispatch_multi before the O(n) rewrite, reading the same input through the same
 // predicates, writing the same outputs.  If this drifts from what 0.1.x shipped, the test compares nothing.
 void reference_plan(const WindowGpuPlanInput& in, GpuPlanSink& P, int32_t* kind, int64_t blob_bytes,
-                    const uint8_t** dma_src) {
+                    const uint8_t** dma_src, PcieBalance* bal = nullptr, double blob_mib = 0.0) {
     const int64_t n = in.n, k = in.k;
     const int32_t* ids = in.ids;
     int64_t distinct[kMaxN], first_of[kMaxN];
@@ -129,7 +130,12 @@ void reference_plan(const WindowGpuPlanInput& in, GpuPlanSink& P, int32_t* kind,
         }
     }
     const bool pcie_ok = in.pcie_num > 0 && in.pcie_layer;
-    const int m = pcie_ok ? (nmiss * in.pcie_num) >> 8 : 0;
+    // the old floor rule; with --pcie-balance on, the cost-balanced share (never above ceil(--pcie-frac) nor the staging)
+    const int m = !pcie_ok ? 0
+                : (bal != nullptr && bal->enabled)
+                    ? bal->choose(nmiss, std::min(strata::core::pcie_balance_cap(nmiss, in.pcie_num),
+                                                  (int) std::min<int64_t>(P.staging_cap, 64)), blob_mib)
+                    : (nmiss * in.pcie_num) >> 8;
     int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
     int64_t pcie_i0[64];
     for (int q = 0; q < nd; ++q) {
@@ -228,7 +234,8 @@ uint64_t rnd() {
 // One window through both planners; returns false (and fills `why`) on any difference.
 bool run_case(const char* name, int64_t n_tok, int64_t k, int64_t n_expert, double resident_frac,
               double pinned_frac, bool with_peer, bool with_helper, int pcie_num, bool pcie_layer,
-              int64_t staging_cap, int pcie_mode, bool slot_off, double dup_frac, bool invalid_ids) {
+              int64_t staging_cap, int pcie_mode, bool slot_off, double dup_frac, bool invalid_ids,
+              const PcieBalance* bal0 = nullptr) {
     const int64_t n = n_tok * k;
     Stub stub;
     stub.n_expert = n_expert;
@@ -275,12 +282,33 @@ bool run_case(const char* name, int64_t n_tok, int64_t k, int64_t n_expert, doub
                                        slot_off ? offs.data() : nullptr, &pcie_a);
     WindowGpuPlanInput in_b = in;
     in_b.pcie_experts = &pcie_b;
+    PcieBalance bal_a, bal_b;   // identical copies: the choice has state (the exploration counter), so each planner gets its own
+    const double blob_mib = (double) stub.blob_bytes / 1048576.0;
+    if (bal0 != nullptr) {
+        bal_a = *bal0;
+        bal_b = *bal0;
+        in.balance = &bal_a;
+        in.blob_mib = blob_mib;
+    }
     window_gpu_plan(in, A.P, kind_a, stub.blob_bytes, dma_a);
-    reference_plan(in_b, B.P, kind_b, stub.blob_bytes, dma_b);
+    reference_plan(in_b, B.P, kind_b, stub.blob_bytes, dma_b, bal0 != nullptr ? &bal_b : nullptr, blob_mib);
     std::string why;
     const bool same = same_plan(A.P, B.P, kind_a, kind_b, dma_a, dma_b, n, why) && pcie_a == pcie_b;
-    check(same, std::string(name) + (same ? "" : " (first difference: " + why + ")"));
+    check(same && bal_a.moved == bal_b.moved && bal_a.layers == bal_b.layers,
+          std::string(name) + (same ? "" : " (first difference: " + why + ")"));
     return same;
+}
+
+// a balance that has measured a pool of `tc` ms/MiB and a link of `tp`; `busy` also gives it a measured contended pool cost
+PcieBalance warmed_balance(double tc, double tp, bool busy) {
+    PcieBalance b;
+    b.set_pcie(tp);
+    for (int i = 0; i < 40; ++i) {
+        b.note_cpu(tc, 5, false);
+        if (busy) b.note_cpu(tc * 1.5, 5, true);
+    }
+    b.enabled = true;
+    return b;
 }
 
 }  // namespace
@@ -293,6 +321,13 @@ int main() {
                  bool slot_off, double dup, bool invalid) {
         run_case(name, n_tok, k, n_expert, res, pin, peer, helper, pcie_num, pcie_layer, staging_cap, pcie_mode,
                  slot_off, dup, invalid);
+        ++ran;
+    };
+    auto c_bal = [&](const char* name, int64_t n_tok, int64_t k, int64_t n_expert, double res, double pin,
+                     bool peer, bool helper, int pcie_num, bool pcie_layer, int64_t staging_cap, int pcie_mode,
+                     bool slot_off, double dup, bool invalid, const PcieBalance& bal) {
+        run_case(name, n_tok, k, n_expert, res, pin, peer, helper, pcie_num, pcie_layer, staging_cap, pcie_mode,
+                 slot_off, dup, invalid, &bal);
         ++ran;
     };
     // targeted corners
@@ -326,6 +361,59 @@ int main() {
                  (int64_t) (rnd() % 65), (int) (rnd() % 3), (rnd() & 1) != 0, (rnd() % 1001) / 1000.0,
                  (rnd() % 4) == 0);
         ++ran;
+    }
+    // --pcie-balance: the same planner, the share chosen from measured costs (the reference calls the same estimator on
+    // its own identical copy); cold (enabled, not yet measured: share 0) and warmed with random pool/link costs
+    {
+        PcieBalance cold;
+        cold.enabled = true;
+        c_bal("balance on but cold: share 0", 8, 10, 512, 0.0, 1.0, false, false, 255, true, 64, 0, false, 0.0, false, cold);
+        for (int t = 0; t < 2000; ++t) {
+            const int64_t n_tok = 1 + (int64_t) (rnd() % 8);
+            const int64_t k = 1 + (int64_t) (rnd() % 10);
+            const int64_t n_expert = 1 + (int64_t) (rnd() % 512);
+            PcieBalance b = warmed_balance(0.01 + (rnd() % 100) / 1000.0, 0.03 + (rnd() % 170) / 1000.0, (rnd() & 1) != 0);
+            c_bal("randomized balanced window", n_tok, k, n_expert, (rnd() % 1001) / 1000.0, (rnd() % 1001) / 1000.0,
+                  (rnd() & 1) != 0, (rnd() & 1) != 0, (int) (rnd() % 256), (rnd() & 1) != 0,
+                  (int64_t) (rnd() % 65), (int) (rnd() % 3), (rnd() & 1) != 0, (rnd() % 1001) / 1000.0,
+                  (rnd() % 4) == 0, b);
+        }
+        // and it is not the floor in disguise: all misses pinned, share bound 255/256, a pool 3.6x cheaper per expert than
+        // the link: the balanced plan reads fewer experts over PCIe than the floor rule, as many as `choose` says
+        const int64_t n_tok = 8, k = 10, n_expert = 512;
+        Stub stub;
+        stub.n_expert = n_expert;
+        stub.blob_bytes = 4096;
+        std::vector<uint8_t> blob_mem((size_t) n_expert * 4096), alias_mem((size_t) n_expert * 4096);
+        stub.blob_base = blob_mem.data();
+        stub.alias_base = alias_mem.data();
+        std::vector<int32_t> host_res((size_t) n_expert, -1);
+        stub.host_res = host_res.data();
+        stub.peer.assign((size_t) n_expert, 0);
+        stub.helper.assign((size_t) n_expert, 0);
+        stub.pinned.assign((size_t) n_expert, 1);
+        std::vector<int32_t> ids((size_t) (n_tok * k));
+        for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) i;   // every entry a distinct, missed expert
+        const double blob_mib = 4096.0 / 1048576.0;
+        PcieBalance b = warmed_balance(0.0245, 0.088, false);
+        PcieBalance expect = b;
+        const int nmiss = (int) ids.size();
+        const int want = expect.choose(nmiss, std::min(strata::core::pcie_balance_cap(nmiss, 255), 64), blob_mib);
+        int64_t fetched_floor = 0, fetched_bal = 0;
+        for (int with_bal = 0; with_bal < 2; ++with_bal) {
+            Sink S(kMaxN, 64, 0, 0x5000000);
+            int32_t kind[kMaxN];
+            const uint8_t* dma[64];
+            PcieBalance bb = b;
+            WindowGpuPlanInput in = make_input(ids.data(), n_tok * k, k, stub, 255, true, nullptr, 4096, nullptr,
+                                               with_bal ? &fetched_bal : &fetched_floor);
+            if (with_bal) { in.balance = &bb; in.blob_mib = blob_mib; }
+            window_gpu_plan(in, S.P, kind, stub.blob_bytes, dma);
+        }
+        check(want > 0 && fetched_bal == want, "balanced plan reads exactly the experts `choose` picks (" +
+                                                   std::to_string(fetched_bal) + " of " + std::to_string(nmiss) + ")");
+        check(fetched_bal < fetched_floor, "fewer PCIe copies than the floor rule when the pool is cheaper (" +
+                                               std::to_string(fetched_bal) + " < " + std::to_string(fetched_floor) + ")");
     }
     std::printf("  %d cases\n", ran);
     if (g_fail != 0) {
