@@ -528,7 +528,8 @@ bool gr_down_max4() {
     return on;
 }
 
-void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0,
+                  bool up_pf = false) {
     const int n_tok = m.T;
 #if defined(STRATA_HIP_GFX906)
     // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
@@ -589,6 +590,21 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 #if defined(STRATA_HIP_GFX906)
     if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
+#endif
+#if !defined(__HIPCC__)
+    if (up_pf) {   // STRATA_HC_FUSED=1: the up read with its weights and inputs requested first (the same bits)
+        switch (n_tok) {
+            case 1: gr_up_pf_kernel<1><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 2: gr_up_pf_kernel<2><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 3: gr_up_pf_kernel<3><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 4: gr_up_pf_kernel<4><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 5: gr_up_pf_kernel<5><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 6: gr_up_pf_kernel<6><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 7: gr_up_pf_kernel<7><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            default: gr_up_pf_kernel<8><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+        }
+        return;
+    }
 #endif
     switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
         case 1: gr_up_multi_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
@@ -847,7 +863,7 @@ __global__ void gr_down_finish_kernel(GrMulti m) {
 
 #endif
 
-#include "hc_q8.cuh"   // S23 STRATA_HC_Q8=1: gr_down_q8_kernel, gr_up_q8_kernel (and the fused single launch, STRATA_HC_Q8_FUSED=1)
+#include "hc_q8.cuh"   // S23 STRATA_HC_Q8=1: gr_down_q8_kernel, gr_up_q8_kernel (and the fused single launch, STRATA_HC_FUSED=1)
 
 
 // S26 STRATA_TSUM=1: gr_down_q8_kernel / gr_up_q8_kernel with each row's T per-token warp sums (and the sums of
@@ -1086,11 +1102,23 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     else gr_up_q8_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
 }
 #if !defined(__HIPCC__)
-// STRATA_HC_Q8_FUSED=1: the two launches below as one (hc_q8.cuh: gr_q8_fused_kernel), the same bits
+// STRATA_HC_FUSED=1, Q8_0 projections.  Default: two launches in which no block waits for another (the down launch's last chunk
+// block of each row group reduces the group's rows, the up launch requests its weights first); STRATA_HC_FUSED_ONE_LAUNCH=1:
+// one launch whose up blocks wait for the down blocks (hc_q8.cuh).  Either way the same bits as the two plain launches below.
+bool hc_one_launch() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_FUSED_ONE_LAUNCH"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 template <int T> void launch_q8_fused_t(const GrMulti& m, float* part, float* ssg, cudaStream_t st, unsigned long long* stamp_buf,
                                         int stamp_i0) {
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-    gr_q8_fused_kernel<T><<<Q8F_GRID, THREADS, 0, st>>>(m, part, ssg, m.a[0].hc_sync);
+    if (hc_one_launch()) {
+        gr_q8_fused_kernel<T><<<Q8F_GRID, THREADS, 0, st>>>(m, part, ssg, m.a[0].hc_sync);
+        return;
+    }
+    gr_q8_down_red_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg, m.a[0].hc_sync);
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    gr_q8_up_pf_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
 }
 #endif
 void launch_q8(const GrMulti& m, float* scratch, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
@@ -1262,8 +1290,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
 #endif
 #if !defined(__HIPCC__)
-    // STRATA_HC_FUSED=1: the staged read's three launches as one, for the windows it carries (up to F1_MAX_T tokens)
-    if (a[0].hc_sync != nullptr && n_tok <= F1_MAX_T && !gr_no_multi() && fused_gr_variant() >= kHcStaged) {
+    // STRATA_HC_FUSED_ONE_LAUNCH=1: the staged read's three launches as one, for the windows it carries (up to F1_MAX_T tokens)
+    if (a[0].hc_sync != nullptr && hc_one_launch() && n_tok <= F1_MAX_T && !gr_no_multi() && fused_gr_variant() >= kHcStaged) {
         launch_f1(m, st, stamp_buf, stamp_i0);
         const cudaError_t e1 = cudaGetLastError();
         if (e1 != cudaSuccess) {
@@ -1274,7 +1302,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
 #endif
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
-    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
+    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0, a[0].hc_sync != nullptr);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
@@ -1598,10 +1626,10 @@ bool fused_gr_fused_check(bool q8) {
     const bool ok = fused_launch_selftest(q8, why);
     done[dev][idx].store(ok ? 1 : 2);
     if (ok)
-        std::fprintf(stderr, "strata hc: CUDA%d: the one-launch %s read equals the multi-launch read bit for bit on this card "
+        std::fprintf(stderr, "strata hc: CUDA%d: the STRATA_HC_FUSED %s read equals the plain read bit for bit on this card "
                              "(1..8 tokens, with and without the pending write)\n", dev, q8 ? "Q8_0" : "BF16");
     else
-        std::fprintf(stderr, "strata hc: CUDA%d: the one-launch %s read is NOT used: %s\n", dev, q8 ? "Q8_0" : "BF16", why.c_str());
+        std::fprintf(stderr, "strata hc: CUDA%d: the STRATA_HC_FUSED %s read is NOT used: %s\n", dev, q8 ? "Q8_0" : "BF16", why.c_str());
     return ok;
 #endif
 }

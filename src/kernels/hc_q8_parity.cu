@@ -1,10 +1,11 @@
 // src/kernels/hc_q8_parity.cu - GPU checks of the hyper-connection read from Q8_0 projections (STRATA_HC_Q8=1) and of its
-// one-launch form (STRATA_HC_Q8_FUSED=1).  Synthetic weights and activations, no model, a few seconds, under 70 MiB of
+// one-launch form (STRATA_HC_FUSED=1).  Synthetic weights and activations, no model, a few seconds, under 70 MiB of
 // VRAM (--bench: about 150 MiB, it keeps six layers' weights so that the reads come from DRAM, not from L2).
 //
 //   hc_q8_parity                  the checks below; exit 0 = all passed
 //   hc_q8_parity --bench [T]      then time one read (T tokens, default 3) in a graph of 96 reads, the way a window runs them:
-//                                 the default BF16 read, the Q8_0 read in two launches, the Q8_0 read in one launch
+//                                 the default BF16 read, the Q8_0 read, and both with the counters set (STRATA_HC_FUSED=1's form;
+//                                 the environment variable STRATA_HC_FUSED_ONE_LAUNCH=1 makes that form the one-launch kernels)
 //
 //   1. the Q8_0 read (two launches) against a double-precision reference computed from the Q8_0 values: the weights and the
 //      formula are right on this GPU (tolerance covers the GPU's exp and fp32 accumulation order)
@@ -101,7 +102,9 @@ struct Read {
     float *R, *Rout, *bo, *inj_prev, *w_norm, *lo, *rs, *inj_out, *mixed, *xn;
     uint8_t* q81;
     unsigned *qcnt, *sync;
-    Read(const hcref::Fixture& fx) : T(fx.T), f(fx) {
+    cudaStream_t st;   // every copy and memset below is ordered with the reads on this stream (the legacy default stream is not
+                       // ordered with a non-blocking one: a late memset would poison a finished read's output)
+    Read(const hcref::Fixture& fx, cudaStream_t stream) : T(fx.T), f(fx), st(stream) {
         R = upload(f.R); bo = upload(f.bo); inj_prev = upload(f.inj_prev); w_norm = upload(f.w_norm);
         auto z = [](size_t n) { float* p = nullptr; check(cudaMalloc((void**) &p, n * 4), "malloc"); check(cudaMemset(p, 0, n * 4), "memset"); return p; };
         Rout = z((size_t) T * D); lo = z((size_t) T * LR); rs = z((size_t) T * HC); inj_out = z((size_t) T * HC);
@@ -115,8 +118,10 @@ struct Read {
                         (void*) mixed, (void*) xn, (void*) q81, (void*) qcnt, (void*) sync}) cudaFree(p);
     }
     void reset_inputs() {   // R is rewritten in place by a read with in_place
-        check(cudaMemcpy(R, f.R.data(), f.R.size() * 4, cudaMemcpyHostToDevice), "reset R");
-        check(cudaMemset(q81, 0x5a, (size_t) T * (N / 32) * 36), "poison q81");
+        check(cudaMemcpyAsync(R, f.R.data(), f.R.size() * 4, cudaMemcpyHostToDevice, st), "reset R");
+        check(cudaMemsetAsync(q81, 0x5a, (size_t) T * (N / 32) * 36, st), "poison q81");
+        check(cudaMemsetAsync(Rout, 0, (size_t) T * D * 4, st), "clear R_out");
+        check(cudaStreamSynchronize(st), "reset sync");
     }
     void call(const Weights& w, const Opts& o, cudaStream_t st) {
         FusedGrArgs a[kFusedGrMaxT];
@@ -157,7 +162,7 @@ struct Read {
 };
 
 bool equal(const Out& a, const Out& b, const Opts& o) {
-    return hcref::same_bits(a.mixed, b.mixed) && hcref::same_bits(a.Rout, b.Rout) && hcref::same_bits(a.rs, b.rs) &&
+    return hcref::same_bits(a.mixed, b.mixed) && (!o.apply || hcref::same_bits(a.Rout, b.Rout)) && hcref::same_bits(a.rs, b.rs) &&
            (!o.inject || hcref::same_bits(a.inject, b.inject)) && (!o.qfuse || a.q81 == b.q81) &&
            (o.q8 || hcref::same_bits(a.lo, b.lo));   // (the Q8_0 read keeps `lo` in shared memory unless it is the one-launch form)
 }
@@ -205,7 +210,7 @@ int main(int argc, char** argv) {
         f.build(T, 900u + (unsigned) T);
         Weights w;
         w.load(f);
-        Read rd(f);
+        Read rd(f, st);
         struct V { bool apply, inject, inject_q8, in_place, qfuse; };
         const V vs[] = {{true, true, false, false, false}, {true, true, false, true, true}, {false, true, true, false, false},
                         {false, false, false, false, true}, {true, false, false, true, false}};
@@ -218,7 +223,7 @@ int main(int argc, char** argv) {
             const Out two = rd.fetch(o);
             if (vi == 0 || vi == 2) {   // 1. against the double reference
                 const hcref::Ref r = hcref::reference(f, o.apply, o.inject, o.inject_q8, f.dq_down, f.dq_up);
-                const double em = hcref::worst(two.mixed, r.mixed), er = hcref::worst(two.Rout, r.Rout), es = hcref::worst(two.rs, r.rs);
+                const double em = hcref::worst(two.mixed, r.mixed), er = o.apply ? hcref::worst(two.Rout, r.Rout) : 0.0, es = hcref::worst(two.rs, r.rs);
                 const double ei = o.inject ? hcref::worst(two.inject, r.inject) : 0.0;
                 std::printf("1  T=%d inject=%s: Q8_0 read vs double reference: mixed %.2e R_out %.2e rs %.2e inject %.2e\n", T,
                             !o.inject ? "none" : o.inject_q8 ? "q8_0" : "bf16", em, er, es, ei);
@@ -273,11 +278,13 @@ int main(int argc, char** argv) {
             for (int replay = 0; replay < 3; ++replay) {
                 std::vector<float> r2 = f.R;
                 for (size_t i = 0; i < r2.size(); ++i) r2[i] = f.R[i] * (0.5f + 0.25f * (float) replay) + 0.01f * (float) (i % 13);
-                check(cudaMemcpy(rd.R, r2.data(), r2.size() * 4, cudaMemcpyHostToDevice), "new R");
+                check(cudaMemcpyAsync(rd.R, r2.data(), r2.size() * 4, cudaMemcpyHostToDevice, st), "new R");
+                check(cudaStreamSynchronize(st), "new R sync");
                 check(cudaGraphLaunch(ge, st), "graph launch");
                 const Out got = rd.fetch(o);
                 Opts ot = o; ot.fused = false;
-                check(cudaMemcpy(rd.R, r2.data(), r2.size() * 4, cudaMemcpyHostToDevice), "new R");
+                check(cudaMemcpyAsync(rd.R, r2.data(), r2.size() * 4, cudaMemcpyHostToDevice, st), "new R");
+                check(cudaStreamSynchronize(st), "new R sync");
                 rd.call(w, ot, st);
                 const Out want = rd.fetch(ot);
                 const bool same = equal(got, want, o);
@@ -337,15 +344,15 @@ int main(int argc, char** argv) {
         f.build(bench_T, 4242u);
         Weights w[SETS];
         for (int i = 0; i < SETS; ++i) w[i].load(f);
-        Read rd(f);
+        Read rd(f, st);
         struct Mode { const char* name; Opts o; double bytes; } modes[4];
         constexpr double kParams = 320.0 * 10240.0;   // one projection matrix
         modes[0] = {"BF16 default read (3 launches)", Opts{}, 2.0 * kParams * 2.0};
         modes[0].o.q8 = false;
         modes[1] = {"Q8_0 read, two launches", Opts{}, 2.0 * kParams * 34.0 / 32.0};
-        modes[2] = {"Q8_0 read, one launch", Opts{}, modes[1].bytes};
+        modes[2] = {"Q8_0 read, STRATA_HC_FUSED", Opts{}, modes[1].bytes};
         modes[2].o.fused = true;
-        modes[3] = {"BF16 read, one launch (<= 4 rows)", Opts{}, modes[0].bytes};
+        modes[3] = {"BF16 read, STRATA_HC_FUSED", Opts{}, modes[0].bytes};
         modes[3].o.q8 = false;
         modes[3].o.fused = true;
         std::printf("bench: T=%d, %d reads per graph, %d weight sets cycled (DRAM, not L2)\n", bench_T, READS, SETS);

@@ -45,8 +45,8 @@ struct FusedGrArgs {
     /// bytes native_quantize_q8_1 would write); q8_cnt = n_embd / 32 zeroed counters owned by the caller (token 0's)
     uint8_t* q8_mixed = nullptr;
     unsigned* q8_cnt = nullptr;
-    /// STRATA_HC_Q8_FUSED=1 (the Q8_0 read only, token 0's): kFusedGrSyncWords zeroed counters owned by the caller, one
-    /// set per device and per concurrent launch; the read's single launch leaves them zero.  Null: the two-launch Q8 read.
+    /// STRATA_HC_FUSED=1 (token 0's, fused_gr_read_multi): kFusedGrSyncWords zeroed counters owned by the caller, one set per
+    /// device and per concurrent launch; the read's single launch leaves them zero.  Null: the multi-launch read.
     unsigned* hc_sync = nullptr;
 };
 constexpr int kFusedGrSyncWords = 16;
@@ -78,11 +78,14 @@ void fused_gr_set_fast(int on);
 void fused_gr_check();
 int fused_gr_variant();
 
-/// STRATA_HC_FUSED=1: the read as ONE launch (`hc_sync` set on token 0's args; kFusedGrSyncWords zeroed counters per device
-/// and concurrent launch).  Every output is bit for bit the multi-launch read's - the BF16 read (staged variant), or with
-/// `q8` the Q8_0 read STRATA_HC_Q8 selects.  This runs both on random weights on the current card (1..8 tokens, with and
-/// without the pending write) and says false, printing why, if they differ by one bit or the fused launch does not finish
-/// as it should; the caller then does not set `hc_sync`.  Once per card and form.  Always false off CUDA (no fused read).
+/// STRATA_HC_FUSED=1 (`hc_sync` set on token 0's args; kFusedGrSyncWords zeroed counters per device and concurrent launch): the
+/// multi-launch read without its redundant work - the Q8_0 read's down launch reduces each row group's partial dots itself and
+/// its up launch starts from the finished values, the BF16 read's up launch requests its weights and inputs first - and, with
+/// STRATA_HC_FUSED_ONE_LAUNCH=1, the whole read as one launch whose blocks wait for each other (CUDA, up to 4 rows for BF16).
+/// Every output is bit for bit the plain multi-launch read's.  This runs both on random weights on the current card (1..8
+/// tokens, with and without the pending write, launched twice) - the BF16 read (staged variant), or with `q8` the Q8_0 read
+/// STRATA_HC_Q8 selects - and says false, printing why, if they differ by one bit or a launch does not finish as it should;
+/// the caller then does not set `hc_sync`.  Once per card and form.  Always false off CUDA.
 bool fused_gr_fused_check(bool q8);
 
 }  // namespace strata::kernels

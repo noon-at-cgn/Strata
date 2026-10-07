@@ -5,7 +5,7 @@
 //
 //   A. gr_down_q8_kernel + gr_up_q8_kernel (STRATA_HC_Q8=1's two launches) against a double-precision reference computed
 //      from the raw Q8_0 bytes: the formula, the chunking and the indexing of the existing read are right.
-//   B. gr_q8_fused_kernel (STRATA_HC_Q8_FUSED=1, one launch) against those two launches, BIT FOR BIT, for 1..8 tokens, with
+//   B. gr_q8_fused_kernel (STRATA_HC_FUSED=1 with STRATA_HC_Q8=1, one launch) against those two launches, BIT FOR BIT, for 1..8 tokens, with
 //      and without the pending write, with and without the inject rows (BF16 and Q8_0), with the S26 q8_1 image, with R_out
 //      in place and not, and under several block dispatch orders and residency limits (including one block at a time):
 //      the fused read changes the launch structure, not one bit of the result; and the counters are zero afterwards.
@@ -53,7 +53,7 @@ struct Out {
     bool ok = true;
 };
 
-enum class Kind { TwoLaunch, Fused };
+enum class Kind { TwoLaunch, Fused, Split };   // Split: STRATA_HC_FUSED=1's launches without waiting blocks
 struct Case {
     bool apply = true, inject = true, inject_q8 = false, in_place = false, qfuse = false;
     Kind kind = Kind::TwoLaunch;
@@ -64,8 +64,8 @@ struct Case {
 template <int T>
 __global__ void gr_q8_fused_noticket_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg, unsigned* sync_) {
     const unsigned task = blockIdx.x;
-    if (task < (unsigned) Q8F_DOWN) gr_q8f_down<T>(m, part, ssg, sync_, (int) (task % Q8_NRG), (int) (task / Q8_NRG));
-    else gr_q8f_up<T>(m, sync_, (int) (task - Q8F_DOWN));
+    if (task < (unsigned) Q8F_DOWN) gr_q8f_down<T, true>(m, part, ssg, sync_, (int) (task % Q8_NRG), (int) (task / Q8_NRG));
+    else gr_q8f_up<T, true>(m, sync_, (int) (task - Q8F_DOWN));
 }
 
 template <int T> void launch_two(const GrMulti& m, float* part, float* ssg) {
@@ -109,10 +109,13 @@ template <int T> Out run_t(const Fixture& f, const Case& c) {
     float* part = xn.data();
     float* ssg = xn.data() + (size_t) T * Q8_NKC * PR;
     if (c.kind == Kind::TwoLaunch) launch_two<T>(m, part, ssg);
-    else launch_fused<T>(m, part, ssg, sync.data(), c.opt);
+    else if (c.kind == Kind::Split) {
+        emu::launch(emu::dim3(Q8_RG + 1, Q8_NKC), emu::dim3(THREADS), [&] { gr_q8_down_red_kernel<T>(m, part, ssg, sync.data()); }, c.opt);
+        emu::launch(emu::dim3(UPM_BLOCKS), emu::dim3(THREADS), [&] { gr_q8_up_pf_kernel<T>(m); }, c.opt);
+    } else launch_fused<T>(m, part, ssg, sync.data(), c.opt);
     Out o;
     o.mixed = mixed; o.Rout = c.in_place ? R : Rout; o.rs = rs; o.inject = inj_out; o.lo = lo; o.q81 = q81;
-    if (c.kind == Kind::Fused)
+    if (c.kind != Kind::TwoLaunch)
         for (unsigned w : sync) if (w != 0) o.ok = false;
     if (c.qfuse)
         for (unsigned w : qcnt) if (w != 0) o.ok = false;
@@ -167,6 +170,12 @@ template <int T> Out run_bf16_t(const Fixture& f, const Bf16Weights& w, const Ca
         emu::launch(emu::dim3(T, HC), emu::dim3(THREADS), [&] { gr_norm_split_kernel(m); });
         emu::launch(emu::dim3(DOWN_BLOCKS + 1), emu::dim3(THREADS), [&] { gr_down_staged_kernel<T, true>(m); }, o0);
         emu::launch(emu::dim3(UPM_BLOCKS), emu::dim3(THREADS), [&] { gr_up_multi_kernel<T, true>(m); });
+    } else if (c.kind == Kind::Split) {   // the staged read's norm and down, the up launch with its weights requested first
+        emu::LaunchOpts o0 = c.opt;
+        o0.dyn_smem = dyn;
+        emu::launch(emu::dim3(T, HC), emu::dim3(THREADS), [&] { gr_norm_split_kernel(m); }, c.opt);
+        emu::launch(emu::dim3(DOWN_BLOCKS + 1), emu::dim3(THREADS), [&] { gr_down_staged_kernel<T, true>(m); }, o0);
+        emu::launch(emu::dim3(UPM_BLOCKS), emu::dim3(THREADS), [&] { gr_up_pf_kernel<T>(m); }, c.opt);
     } else {
         m.a[0].hc_sync = sync.data();
         emu::LaunchOpts o = c.opt;
@@ -175,7 +184,7 @@ template <int T> Out run_bf16_t(const Fixture& f, const Bf16Weights& w, const Ca
     }
     Out o;
     o.mixed = mixed; o.Rout = c.in_place ? R : Rout; o.rs = rs; o.inject = inj_out; o.lo = lo; o.q81 = q81;
-    if (c.kind == Kind::Fused)
+    if (c.kind != Kind::TwoLaunch)
         for (unsigned v : sync) if (v != 0) o.ok = false;
     if (c.qfuse)
         for (unsigned v : qcnt) if (v != 0) o.ok = false;
@@ -258,6 +267,16 @@ int main(int argc, char** argv) {
                             same ? "bit-identical" : "DIFFERS", o.ok ? "" : " COUNTERS NOT ZERO", secs());
                 CHECK(same); CHECK(o.ok);
             }
+            {   // the split form: two launches, no block waits for another
+                Case c = base;
+                c.kind = Kind::Split;
+                const Out o = run(f, c);
+                const bool same = same_bits(o.mixed, ref.mixed) && same_bits(o.Rout, ref.Rout) && same_bits(o.rs, ref.rs) &&
+                                  (!v.inject || same_bits(o.inject, ref.inject)) && (!v.qfuse || o.q81 == ref.q81);
+                std::printf("B  T=%d apply=%d inject=%d%s in_place=%d qfuse=%d split launches (down reduces, up prefetches): %s%s\n", T, v.apply,
+                            v.inject, v.inject_q8 ? "(q8)" : "", v.in_place, v.qfuse, same ? "bit-identical" : "DIFFERS", o.ok ? "" : " COUNTERS NOT ZERO");
+                CHECK(same); CHECK(o.ok);
+            }
             if (vi == 0) {   // lo: finite, and the silu of the reference's dot to float rounding
                 Case c = base; c.kind = Kind::Fused;
                 const Out o = run(f, c);
@@ -290,6 +309,17 @@ int main(int argc, char** argv) {
                 const double em = worst(ref.mixed, r.mixed), el = worst(ref.lo, r.lo), er = worst(ref.rs, r.rs);
                 std::printf("E  T=%d staged BF16 read vs double reference: mixed %.2e lo %.2e rs %.2e\n", T, em, el, er);
                 CHECK(em < 5e-6); CHECK(el < 5e-6); CHECK(er < 1e-6);
+            }
+            {   // the up launch with its weights requested first
+                Case c = base;
+                c.kind = Kind::Split;
+                const Out o = run_bf16(f, w, c);
+                const bool same = same_bits(o.mixed, ref.mixed) && same_bits(o.Rout, ref.Rout) && same_bits(o.rs, ref.rs) &&
+                                  same_bits(o.lo, ref.lo) && (!base.inject || same_bits(o.inject, ref.inject)) &&
+                                  (!base.qfuse || o.q81 == ref.q81);
+                std::printf("E  T=%d apply=%d inject=%d in_place=%d qfuse=%d prefetching up launch: %s\n", T, base.apply, base.inject,
+                            base.in_place, base.qfuse, same ? "bit-identical" : "DIFFERS");
+                CHECK(same);
             }
             struct Disp { emu::Order order; int resident; };
             const Disp disps[] = {{emu::Order::Ascending, 12}, {emu::Order::Descending, 4}, {emu::Order::Shuffled, 3}, {emu::Order::Ascending, 1}};
