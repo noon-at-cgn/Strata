@@ -6,6 +6,8 @@
 //         rows up, a pool whose workers sleep between layers) through run_split_multi_native in both drains and all kernel
 //         modes, switched at random between layers; every output memcmp-equal to a single-thread reference built from
 //         native_gu_rows / native_quant_h / native_down_rows.  Exit code 1 on any difference or a stalled layer.
+//     pool_layer_test --expect-drain N
+//         only checks that STRATA_POOL_DRAIN gave start-up drain N (ctest runs it for each setting).
 //     pool_layer_test --bench [--epl 3.3] [--nt 1] [--layers 2000] [--mb 768] [--drain barriered,counters]
 //                             [--kernel ggml,fast] [--gu-rows 40] [--down-rows 160] [--workers N] [--no-host]
 //         the real pool (workers pinned to physical cores as in the engine) on a pool of --mb MiB of random expert blobs:
@@ -262,6 +264,14 @@ int bench_main(int argc, char** argv) {
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--bench") return bench_main(argc, argv);
+    // --expect-drain N: the start-up drain STRATA_POOL_DRAIN must have produced (0 barriered, 1 counters)
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--expect-drain") {
+            cpu::ExpertPool pool(1, false, true);
+            const int want = std::atoi(argv[i + 1]), got = (int) pool.layer_drain();
+            std::printf("pool_layer_test: start-up drain %d, expected %d: %s\n", got, want, got == want ? "ok" : "FAIL");
+            return got == want ? 0 : 1;
+        }
     cpu::NativeFmt f, f8;
     std::string err;
     if (!cpu::native_fmt(12, 7, 2560, 640, f, err)) { std::printf("native_fmt: %s\n", err.c_str()); return 2; }
@@ -269,7 +279,7 @@ int main(int argc, char** argv) {
     const Case cases[] = {
         {1, true, 40, 160, 20000},  {2, true, 4, 4, 20000},     {3, false, 8, 12, 20000}, {5, true, 40, 160, 20000},
         {5, true, 64, 256, 0},      {8, true, 40, 160, 20000},  {8, false, 100, 600, 0},  {16, true, 4, 8, 20000},
-        {4, true, 640, 2560, 20000},
+        {4, true, 640, 2560, 20000}, {16, true, 4, 8, 0}, {6, false, 4, 4, 0}, {3, true, 40, 160, 1},
     };
     int bad = 0;
     for (const Case& c : cases) {

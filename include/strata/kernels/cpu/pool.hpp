@@ -323,6 +323,7 @@ private:
     };
     std::unique_ptr<LayerExpert[]> lexp_;   // kMaxSplitMulti of them
     alignas(64) std::atomic<int> lexp_down_done_{0};   // experts whose down rows are all done
+    alignas(64) std::atomic<uint32_t> layer_done_{0};  // raised by the last down chunk of the layer; the host's and the workers' exit
     int l_n_ = 0, l_gu_rows = 40, l_down_rows = 160, l_gu_chunks = 0, l_down_chunks = 0;
     std::atomic<int> layer_drain_{0};
     void layer_work(int start);

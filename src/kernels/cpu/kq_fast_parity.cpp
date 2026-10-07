@@ -10,6 +10,8 @@
 //         for these formats: native_expert_parity compares kq256 the same way); and the fast kernel's rows over [0, N)
 //         against the union of random sub-ranges (partitioning the rows over workers changes no bit).  Exit code 1 on
 //         any difference.
+//     kq_fast_parity --expect-kernel N
+//         only checks that the environment (STRATA_KQ_KERNEL, STRATA_KQ256) gave start-up mode N (ctest runs it for each setting).
 //     kq_fast_parity --bench [--mode ggml,kq256,fast] [--nt 1,2,3,4] [--threads T] [--cpu0 C] [--cpus a,b,c] [--mb 512]
 //                            [--experts 300] [--reps 3]
 //         weights streamed from DRAM (a pool of --mb MiB of random expert blobs, far above the L3), one expert per step in
@@ -416,6 +418,13 @@ int bench_main(int argc, char** argv) {
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--bench") return bench_main(argc, argv);
+    // --expect-kernel N: the start-up mode the environment (STRATA_KQ_KERNEL / STRATA_KQ256) must have produced
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--expect-kernel") {
+            const int want = std::atoi(argv[i + 1]), got = cpu::native_kq_kernel();
+            std::printf("kq_fast_parity: start-up kernel mode %d, expected %d: %s\n", got, want, got == want || !cpu::cpu_avx2_ok() ? "ok" : "FAIL");
+            return got == want || !cpu::cpu_avx2_ok() ? 0 : 1;
+        }
     if (!cpu::cpu_avx2_ok()) { std::printf("kq_fast_parity: this CPU has no AVX2, nothing to test (skipped)\n"); return 0; }
     // the group sizes 1..8 and several widths (n_embd must be a multiple of 256, n_ff of 32)
     test_geometry(2560, 640);
