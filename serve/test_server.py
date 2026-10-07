@@ -1258,6 +1258,13 @@ class SamplingKeys(unittest.TestCase):
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
 
+    def test_prefill_pipe_k_key(self):
+        self.assertIn("prefill_pipe_k=3", self.keys(temperature=0, strata_tune={"prefill_pipe_k": 3}))
+        for bad in (0, 17, 2.0, True, "2", -1):
+            k = self.keys(strata_tune={"prefill_pipe_k": bad})
+            self.assertFalse([x for x in k if x.split("=")[0] == "prefill_pipe_k"], bad)
+        self.assertFalse([x for x in self.keys(temperature=0) if x.startswith("prefill_pipe_k")])
+
     def test_checkpoint_key(self):
         self.assertIn("ckpt=0", self.keys(temperature=0, strata_checkpoint=False))
         for absent in ({}, {"strata_checkpoint": True}, {"strata_checkpoint": 0}, {"cache_prompt": False}):
