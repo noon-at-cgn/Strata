@@ -12,6 +12,7 @@
 //      rows BF16 / Q8_0 / none, R_out in place and not, with the q8_1 image (STRATA_QFUSE); the block counters are zero after
 //   3. the same through a CUDA graph, replayed with new inputs (counters must reset), 96 reads back to back
 //   4. the fused read with most of every SM taken by another kernel (it must still finish: its blocks start in ticket order)
+//   2b the same for the BF16 read (the default weights): the one-launch form against the staged read's three launches
 //   5. the default BF16 read with the pack's BF16 copy of the same weights, against the Q8_0 read: printed (the numeric
 //      difference STRATA_HC_Q8 makes in one read), not a pass/fail
 #include "strata/kernels/fused_gr.hpp"
@@ -88,7 +89,7 @@ struct Opts {
     bool q8 = true, fused = false;   // q8 false: the default BF16 read
 };
 struct Out {
-    std::vector<float> mixed, Rout, rs, inject;
+    std::vector<float> mixed, Rout, rs, inject, lo;
     std::vector<uint8_t> q81;
     bool counters_zero = true;
 };
@@ -131,8 +132,8 @@ struct Read {
             if (o.q8) {
                 a[t].q8_down = w.q8_down; a[t].q8_up = w.q8_up;
                 a[t].q8_inject = o.inject && o.inject_q8 ? w.q8_inj : nullptr;
-                if (o.fused) a[t].hc_sync = sync;
             }
+            if (o.fused) a[t].hc_sync = sync;
             a[t].eps = f.eps;
             a[t].lo = lo + (size_t) t * LR; a[t].rs = rs + (size_t) t * HC;
             a[t].inject_out = inj_out + (size_t) t * HC; a[t].mixed = mixed + (size_t) t * N;
@@ -147,6 +148,7 @@ struct Read {
         r.Rout = download(o.in_place ? R : Rout, (size_t) T * D);
         r.rs = download(rs, (size_t) T * HC);
         r.inject = download(inj_out, (size_t) T * HC);
+        r.lo = download(lo, (size_t) T * LR);
         r.q81 = download(q81, (size_t) T * (N / 32) * 36);
         for (unsigned v : download(sync, kFusedGrSyncWords)) if (v != 0) r.counters_zero = false;
         for (unsigned v : download(qcnt, N / 32)) if (v != 0) r.counters_zero = false;
@@ -156,7 +158,8 @@ struct Read {
 
 bool equal(const Out& a, const Out& b, const Opts& o) {
     return hcref::same_bits(a.mixed, b.mixed) && hcref::same_bits(a.Rout, b.Rout) && hcref::same_bits(a.rs, b.rs) &&
-           (!o.inject || hcref::same_bits(a.inject, b.inject)) && (!o.qfuse || a.q81 == b.q81);
+           (!o.inject || hcref::same_bits(a.inject, b.inject)) && (!o.qfuse || a.q81 == b.q81) &&
+           (o.q8 || hcref::same_bits(a.lo, b.lo));   // (the Q8_0 read keeps `lo` in shared memory unless it is the one-launch form)
 }
 
 double ms_per(cudaGraphExec_t g, cudaStream_t st, int reps) {
@@ -233,9 +236,33 @@ int main(int argc, char** argv) {
                 CHECK(same); CHECK(fused.counters_zero);
             }
         }
-        // 3. a captured graph of 96 fused reads, replayed with new inputs
+        // 2b. the BF16 read (the default weights): the one-launch form against the staged read's three launches (up to 4 rows;
+        // more rows keep the three launches and must come out the same, trivially)
         {
+            const V vb[] = {{true, true, false, false, false}, {true, true, false, true, true}, {false, false, false, false, true}};
+            for (size_t vi = 0; vi < sizeof(vb) / sizeof(vb[0]); ++vi) {
+                Opts o;
+                o.apply = vb[vi].apply; o.inject = vb[vi].inject; o.in_place = vb[vi].in_place; o.qfuse = vb[vi].qfuse;
+                o.q8 = false; o.fused = false;
+                rd.reset_inputs();
+                rd.call(w, o, st);
+                const Out three = rd.fetch(o);
+                o.fused = true;
+                for (int rep = 0; rep < 2; ++rep) {
+                    rd.reset_inputs();
+                    rd.call(w, o, st);
+                    const Out one = rd.fetch(o);
+                    const bool same = equal(three, one, o);
+                    std::printf("2b T=%d BF16 apply=%d inject=%d in_place=%d qfuse=%d rep %d: one launch vs three %s%s\n", T, o.apply, o.inject,
+                                o.in_place, o.qfuse, rep, same ? "bit-identical" : "DIFFERS", one.counters_zero ? "" : ", COUNTERS NOT ZERO");
+                    CHECK(same); CHECK(one.counters_zero);
+                }
+            }
+        }
+        // 3. a captured graph of 96 fused reads, replayed with new inputs
+        for (int q8 = 1; q8 >= 0; --q8) {
             Opts o;   // apply, bf16 inject, not in place
+            o.q8 = q8 != 0;
             o.fused = true;
             cudaGraph_t g = nullptr;
             cudaGraphExec_t ge = nullptr;
@@ -255,7 +282,7 @@ int main(int argc, char** argv) {
                 const Out want = rd.fetch(ot);
                 const bool same = equal(got, want, o);
                 if (T == 1 || T == 3 || T == 8)
-                    std::printf("3  T=%d graph of 96 fused reads, replay %d: %s%s\n", T, replay, same ? "bit-identical to a two-launch read" : "DIFFERS",
+                    std::printf("3  T=%d graph of 96 fused %s reads, replay %d: %s%s\n", T, q8 ? "Q8_0" : "BF16", replay, same ? "bit-identical to the multi-launch read" : "DIFFERS",
                                 got.counters_zero ? "" : ", COUNTERS NOT ZERO");
                 CHECK(same); CHECK(got.counters_zero);
             }
@@ -263,8 +290,9 @@ int main(int argc, char** argv) {
             cudaGraphDestroy(g);
         }
         // 4. most of every SM taken by another kernel
-        if (T == 3 || T == 8) {
+        for (int q8 = 1; q8 >= 0 && (T == 3 || T == 8 || T == 4); --q8) {
             Opts o;
+            o.q8 = q8 != 0;
             o.fused = true;
             Opts ot = o; ot.fused = false;
             rd.reset_inputs();
@@ -285,7 +313,7 @@ int main(int argc, char** argv) {
             check(cudaStreamSynchronize(other), "hog sync");
             cudaStreamDestroy(other);
             const bool same = equal(got, want, o);
-            std::printf("4  T=%d with a kernel holding 56 KiB and 1024 threads on every SM: fused read %s, %.1f ms%s\n", T, same ? "bit-identical" : "DIFFERS", ms,
+            std::printf("4  T=%d with a kernel holding 56 KiB and 1024 threads on every SM: fused %s read %s, %.1f ms%s\n", T, q8 ? "Q8_0" : "BF16", same ? "bit-identical" : "DIFFERS", ms,
                         got.counters_zero ? "" : ", COUNTERS NOT ZERO");
             CHECK(same); CHECK(got.counters_zero);
         }
@@ -310,13 +338,16 @@ int main(int argc, char** argv) {
         Weights w[SETS];
         for (int i = 0; i < SETS; ++i) w[i].load(f);
         Read rd(f);
-        struct Mode { const char* name; Opts o; double bytes; } modes[3];
+        struct Mode { const char* name; Opts o; double bytes; } modes[4];
         constexpr double kParams = 320.0 * 10240.0;   // one projection matrix
         modes[0] = {"BF16 default read (3 launches)", Opts{}, 2.0 * kParams * 2.0};
         modes[0].o.q8 = false;
         modes[1] = {"Q8_0 read, two launches", Opts{}, 2.0 * kParams * 34.0 / 32.0};
         modes[2] = {"Q8_0 read, one launch", Opts{}, modes[1].bytes};
         modes[2].o.fused = true;
+        modes[3] = {"BF16 read, one launch (<= 4 rows)", Opts{}, modes[0].bytes};
+        modes[3].o.q8 = false;
+        modes[3].o.fused = true;
         std::printf("bench: T=%d, %d reads per graph, %d weight sets cycled (DRAM, not L2)\n", bench_T, READS, SETS);
         for (auto& m : modes) {
             cudaGraph_t g = nullptr;
