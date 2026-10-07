@@ -1242,6 +1242,15 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_BUILD_TESTS)
     add_test(NAME kq_fast_parity COMMAND kq_fast_parity)
   endif()
+  # the expert pool's Barriered and Counters layer drains on a native Unsloth layer, bit for bit against a single-thread
+  # reference at random layer shapes, worker counts and chunk sizes, switching drain and row kernel between layers;
+  # --bench: ms per layer / per distinct expert on the real pinned pool.  No GPU, no model.
+  add_executable(pool_layer_test src/kernels/cpu/pool_layer_test.cpp)
+  target_link_libraries(pool_layer_test PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME pool_layer_test COMMAND pool_layer_test)
+    set_tests_properties(pool_layer_test PROPERTIES TIMEOUT 300)
+  endif()
   # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
   add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
   target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
