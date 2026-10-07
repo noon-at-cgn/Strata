@@ -200,6 +200,17 @@ int main(int argc, char** argv) {
     std::printf("device %d: %s, sm_%d%d, %d SMs\n", dev, prop.name, cc_major, cc_minor, sms);
     if (cc_major < 7) { std::printf("compute capability < 7.0: the fused read is not supported there; nothing to check\n"); return 0; }
     fused_gr_check();   // the default read's variant check, as the engine does at start
+    // the engine's own start-up check of STRATA_HC_FUSED=1 (Verifier::init): it must pass on a card where the reads pass, in a
+    // process whose heap is not a fresh one (the check's buffers land wherever the allocator has room), for both forms
+    {
+        std::vector<void*> holes;   // alternate live blocks and freed holes, so that the check's allocations are not adjacent
+        for (int i = 0; i < 24; ++i) { void* p = nullptr; if (cudaMalloc(&p, (size_t) (1 + i % 5) * (1u << 20) + 4096u * (size_t) i) == cudaSuccess) holes.push_back(p); }
+        for (size_t i = 0; i < holes.size(); i += 2) cudaFree(holes[i]);
+        const bool ok_bf16 = fused_gr_fused_check(false), ok_q8 = fused_gr_fused_check(true);
+        std::printf("0  engine start-up check of STRATA_HC_FUSED on a fragmented heap: BF16 %s, Q8_0 %s\n", ok_bf16 ? "passed" : "FAILED", ok_q8 ? "passed" : "FAILED");
+        CHECK(ok_bf16); CHECK(ok_q8);
+        for (size_t i = 1; i < holes.size(); i += 2) cudaFree(holes[i]);
+    }
 
     cudaStream_t st;
     check(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
