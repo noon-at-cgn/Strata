@@ -901,6 +901,10 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+            # the cost-balanced PCIe share (engine --pcie-balance) on or off for this request: true/false or 1/0
+            pb = tune.get("pcie_balance")
+            if isinstance(pb, bool) or (isinstance(pb, (int, float)) and pb in (0, 1)):
+                keys += f" pcie_balance={int(pb)}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
