@@ -774,6 +774,11 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
                       int64_t ldy) {
     namespace mmq = strata::prefill::mmq;
     constexpr int64_t kRows = 1024, kMaxK = 8192;
+    static const int64_t env_min_n = [] {
+        const char* e = std::getenv("STRATA_PREFILL_DENSE_MMQ_MIN_N");
+        return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 2048;
+    }();
+    if (N < (dense_mmq_min_n_ >= 0 ? dense_mmq_min_n_ : env_min_n)) return false;
     if (!dense_mmq_ || mmq_failed_ || !mmq::built() || !mmq::fits(type, N)) return false;
     // K must be a multiple of 256: llama.cpp's MMQ loads the weights in 256-value K chunks, and the
     // chunk past a partial row reads past the row (the next row's bytes - or, for the last weight

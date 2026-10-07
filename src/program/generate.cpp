@@ -8797,6 +8797,9 @@ int main(int argc, char** argv) {
             // prefill_pipe_k=N: how many prompt chunks a read beside decoding slots takes per pipeline run (a layer
             // split); 0 = not asked: STRATA_PREFILL_PIPE_K, else 1
             int req_pipe_k = 0;
+            // prefill_help_frac=f: the idle card's share of a one-chunk read's streamed experts for this request
+            // (STRATA_PREFILL_HELP=1 engines only): 0 = none, up to 1; -1 = not asked (the rule, STRATA_PREFILL_HELP_FRAC)
+            double req_help_frac = -1.0;
             int req_pipeline_windows = -1;   // pipeline_windows=0|2: --pipeline-windows for this request (-1 = the start-up value)
             int req_pcie_balance = -1;   // pcie_balance=0|1: the cost-balanced PCIe share for this request (-1: --pcie-balance)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
@@ -8829,6 +8832,7 @@ int main(int argc, char** argv) {
                     else if (key == "batch_overlap") req_batch_overlap = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "pipeline_windows") req_pipeline_windows = std::clamp(std::atoi(tok.c_str() + eq + 1), 0, 2);
                     else if (key == "prefill_pipe_k") req_pipe_k = std::max(std::atoi(tok.c_str() + eq + 1), 0);
+                    else if (key == "prefill_help_frac") req_help_frac = std::clamp((double) fv, 0.0, 1.0);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -9583,7 +9587,7 @@ int main(int argc, char** argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
-                // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
+                strata::prefill::Prefill::set_help_frac_request(req_help_frac);   // -1 clears the last request's value
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {

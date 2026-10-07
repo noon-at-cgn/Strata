@@ -57,6 +57,9 @@ public:
     /// without the MMQ kernels, whatever it is told.
     void set_dense_mmq(bool on);
     bool dense_mmq() const { return dense_mmq_; }
+    /// Products with fewer output rows N than this stay on cuBLAS even with the dense MMQ on (their MMQ grids are too small to
+    /// pay: ~2x slower than cuBLAS at N 512-640, measured on an RTX 3080).  Default 2048; STRATA_PREFILL_DENSE_MMQ_MIN_N.
+    void set_dense_mmq_min_n(int64_t n) { dense_mmq_min_n_ = n; }
     /// native() products since set-up that went through MMQ / through dequantize + cuBLAS (STRATA_PREFILL_TIMING's line).
     int64_t dense_mmq_calls() const { return dense_mmq_calls_; }
     int64_t dense_cublas_calls() const { return dense_cublas_calls_; }
@@ -95,6 +98,7 @@ private:
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
     bool dense_mmq_ = false;
+    int64_t dense_mmq_min_n_ = -1;   // < 0: STRATA_PREFILL_DENSE_MMQ_MIN_N, else 2048
     int64_t dense_mmq_calls_ = 0, dense_cublas_calls_ = 0;
     static bool dense_mmq_env();
     struct Timing;

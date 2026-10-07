@@ -61,6 +61,21 @@ const Shape kShapes[] = {
     {"attn_output", 2560, 6144, 0, 1},   {"shexp gate/up", 640, 2560, 2, 2}, {"shexp down (K=640)", 2560, 640, 1, 1},
 };
 
+// a matrix of any ggml type from a smooth deterministic pattern (for the timing; layout, not values, matters there)
+std::vector<uint8_t> make_q(ggml_type t, int64_t N, int64_t K, uint32_t seed) {
+    std::mt19937 g(seed);
+    std::normal_distribution<float> n01(0.0f, 1.0f);
+    const auto* tr = ggml_get_type_traits(t);
+    const size_t rb = ggml_row_size(t, K);
+    std::vector<uint8_t> out((size_t) N * rb);
+    std::vector<float> row((size_t) K);
+    for (int64_t r = 0; r < N; ++r) {
+        for (auto& v : row) v = 0.02f * n01(g);
+        tr->from_float_ref(row.data(), out.data() + (size_t) r * rb, K);
+    }
+    return out;
+}
+
 // activations like the engine's: rows differ in scale, channel gains are log-normal, a few channels are massive
 std::vector<float> make_x(int64_t T, int64_t K, uint32_t seed) {
     std::mt19937 g(seed);
@@ -127,6 +142,7 @@ int main(int argc, char** argv) {
         std::string err;
         constexpr int64_t kScratch = 32ll << 20;   // the engine's GEMM_SCRATCH: FP16 elements
         if (!gm.init(s, kScratch, err)) throw std::runtime_error(err);
+        gm.set_dense_mmq_min_n(0);   // every shape through MMQ here, to check and time them; the engine's default keeps N < 2048 on cuBLAS
         cudaEvent_t e0, e1;
         ck(cudaEventCreate(&e0), "event");
         ck(cudaEventCreate(&e1), "event");
@@ -218,6 +234,95 @@ int main(int argc, char** argv) {
             std::printf("one stage's dense GGUF projections per %lld-token chunk (18 GDN + 6 QSA layers): default %.0f ms, MMQ %.0f ms "
                         "(%.2fx); excludes the BF16 hyper-connection products and the FP16->FP32 widening MMQ's call includes\n",
                         (long long) T, stage_ms[0], stage_ms[1], stage_ms[1] > 0 ? stage_ms[0] / stage_ms[1] : 0.0);
+        if (bench) {
+            // The other GEMM-shaped work of a stage's chunk, for the phase split: one MMQ group of 16 experts (gate/up Q4_K 1280 x 2560,
+            // down Q5_1 2560 x 640, T x 10 / 512 = 160 rows each as at T = 8192 with 10 experts per token) as prefill.cpp's compute()
+            // runs it (gate/up product, SwiGLU, q8_1 quantize, down product), and the BF16 hyper-connection products.
+            namespace mmq = strata::prefill::mmq;
+            if (mmq::supported(GGML_TYPE_Q4_K) && mmq::supported(GGML_TYPE_Q5_1)) {
+                constexpr int G = 16;
+                const int rows_per = (int) std::max<int64_t>(1, T * 10 / 512), rows = G * rows_per;
+                std::vector<uint8_t> wgu, wd;
+                std::vector<float> junk;
+                for (int e = 0; e < G; ++e) {
+                    std::vector<uint8_t> a = make_q(GGML_TYPE_Q4_K, 1280, 2560, 300 + e), b = make_q(GGML_TYPE_Q5_1, 2560, 640, 400 + e);
+                    wgu.insert(wgu.end(), a.begin(), a.end());
+                    wd.insert(wd.end(), b.begin(), b.end());
+                }
+                wgu.resize(wgu.size() + 4096, 0);
+                wd.resize(wd.size() + 4096, 0);
+                const std::vector<float> x = make_x(rows, 2560, 77);
+                std::vector<int32_t> bounds((size_t) G + 1), ident((size_t) rows);
+                for (int e = 0; e <= G; ++e) bounds[(size_t) e] = e * rows_per;
+                for (int i = 0; i < rows; ++i) ident[(size_t) i] = i;
+                Dev dgu(wgu.size()), dd(wd.size()), dx(x.size() * 4), db(bounds.size() * 4), di(ident.size() * 4),
+                    dxq(mmq::q8_bytes(rows, 2560)), dhq(mmq::q8_bytes(rows, 640)), dGU((size_t) rows * 1280 * 4),
+                    dH((size_t) rows * 640 * 4), dY((size_t) rows * 2560 * 4);
+                ck(cudaMemcpy(dgu.p, wgu.data(), wgu.size(), cudaMemcpyHostToDevice), "gu");
+                ck(cudaMemcpy(dd.p, wd.data(), wd.size(), cudaMemcpyHostToDevice), "d");
+                ck(cudaMemcpy(dx.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+                ck(cudaMemcpy(db.p, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice), "b");
+                ck(cudaMemcpy(di.p, ident.data(), ident.size() * 4, cudaMemcpyHostToDevice), "i");
+                ck(cudaDeviceSynchronize(), "uploads");
+                mmq::Context ctx;
+                auto group = [&]() {
+                    mmq::quantize((const float*) dx.p, nullptr, dxq.p, GGML_TYPE_Q4_K, 2560, 2560, rows, s);
+                    mmq::Product p;
+                    p.w = dgu.p; p.type = GGML_TYPE_Q4_K; p.w_rows = 1280; p.w_cols = 2560;
+                    p.expert_bytes = mmq::matrix_bytes(GGML_TYPE_Q4_K, 1280, 2560); p.n = G; p.xq = dxq.p;
+                    p.bounds = (const int32_t*) db.p; p.ids = (const int32_t*) di.p; p.total_rows = rows; p.max_rows = rows_per;
+                    p.dst = (float*) dGU.p; p.ld_dst = 1280;
+                    ctx.run(p, s);
+                    mmq::swiglu((const float*) dGU.p, (float*) dH.p, rows, 640, false, s);
+                    mmq::quantize((const float*) dH.p, nullptr, dhq.p, GGML_TYPE_Q5_1, 640, 640, rows, s);
+                    mmq::Product q;
+                    q.w = dd.p; q.type = GGML_TYPE_Q5_1; q.w_rows = 2560; q.w_cols = 640;
+                    q.expert_bytes = mmq::matrix_bytes(GGML_TYPE_Q5_1, 2560, 640); q.n = G; q.xq = dhq.p;
+                    q.bounds = (const int32_t*) db.p; q.ids = (const int32_t*) di.p; q.total_rows = rows; q.max_rows = rows_per;
+                    q.dst = (float*) dY.p; q.ld_dst = 2560;
+                    ctx.run(q, s);
+                };
+                std::vector<double> v;
+                for (int r = -1; r < reps; ++r) {
+                    ck(cudaEventRecord(e0, s), "rec");
+                    group();
+                    ck(cudaEventRecord(e1, s), "rec");
+                    ck(cudaEventSynchronize(e1), "sync");
+                    float t = 0;
+                    ck(cudaEventElapsedTime(&t, e0, e1), "elapsed");
+                    if (r >= 0) v.push_back(t);
+                }
+                const double g = median(v);
+                std::printf("MoE group of %d experts x %d rows: %.3f ms (%.1f int8-equivalent TFLOP/s); a layer is 32 such groups, a stage's "
+                            "24 layers %.0f ms per chunk\n", G, rows_per, g,
+                            2.0 * rows * (1280.0 * 2560 + 2560.0 * 640) / (g * 1e-3) / 1e12, g * 32 * 24);
+            }
+            {   // BF16 products of a hyper-connection read (down 320 x 10240, up 10240 x 320, inject 4 x 10240), two per layer
+                struct B { const char* name; int64_t N, K; } bs[] = {{"hc down", 320, 10240}, {"hc up", 10240, 320}, {"hc inject", 4, 10240}};
+                double per_layer = 0;
+                for (const B& b : bs) {
+                    Dev w((size_t) (b.N * b.K) * 2), xx((size_t) (T * b.K) * 2), y((size_t) (T * b.N) * 4);
+                    ck(cudaMemset(w.p, 0x3c, w.n), "w");
+                    ck(cudaMemset(xx.p, 0x3c, xx.n), "x");
+                    ck(cudaDeviceSynchronize(), "sync");
+                    std::vector<double> v;
+                    for (int r = -1; r < reps; ++r) {
+                        ck(cudaEventRecord(e0, s), "rec");
+                        gm.bf16((const uint16_t*) xx.p, (const uint16_t*) w.p, (float*) y.p, T, b.N, b.K);
+                        ck(cudaEventRecord(e1, s), "rec");
+                        ck(cudaEventSynchronize(e1), "sync");
+                        float t = 0;
+                        ck(cudaEventElapsedTime(&t, e0, e1), "elapsed");
+                        if (r >= 0) v.push_back(t);
+                    }
+                    const double m = median(v);
+                    std::printf("%-10s BF16 N %5lld K %5lld: %.3f ms (%.1f TFLOP/s)\n", b.name, (long long) b.N, (long long) b.K, m,
+                                2.0 * (double) T * (double) b.N * (double) b.K / (m * 1e-3) / 1e12);
+                    per_layer += 2 * m;   // attention half and MoE half
+                }
+                std::printf("hyper-connection BF16 products: %.2f ms per layer, %.0f ms per stage chunk (24 layers)\n", per_layer, per_layer * 24);
+            }
+        }
         cudaEventDestroy(e0);
         cudaEventDestroy(e1);
         std::printf(failures ? "prefill_dense_mmq_test: %d failure(s)\n" : "prefill_dense_mmq_test passed\n", failures);

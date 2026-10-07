@@ -1249,7 +1249,9 @@ bool split_help_env() {
 // 1440 (1609), 6K 1811 / 1660 / 1471 (2038), 8K 1895 / 1804 / 1663 (2230) - the best share falls with T and from ~4K
 // none pays, which this rule follows (0.41 at 1.5K, 0.32 at 3K, off from ~3.3K).
 // STRATA_PREFILL_HELP_FRAC sets the share for every T.
+std::atomic<double> g_help_frac_request{-1.0};   // Prefill::set_help_frac_request
 double split_help_frac(int64_t T) {
+    if (const double r = g_help_frac_request.load(std::memory_order_relaxed); r >= 0.0) return std::min(r, 1.0);
     static const double fixed = [] {
         const char* e = std::getenv("STRATA_PREFILL_HELP_FRAC");
         return e ? std::clamp(std::atof(e), 0.0, 1.0) : -1.0;
@@ -1259,6 +1261,8 @@ double split_help_frac(int64_t T) {
     return f >= 0.3 ? f : 0.0;
 }
 }  // namespace
+
+void Prefill::set_help_frac_request(double frac) { g_help_frac_request.store(frac < 0.0 ? -1.0 : std::min(frac, 1.0), std::memory_order_relaxed); }
 
 bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     Impl& m = *impl_;

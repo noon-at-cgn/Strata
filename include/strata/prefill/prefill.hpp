@@ -84,6 +84,10 @@ public:
     /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
+    /// The layer split's idle-card help share (STRATA_PREFILL_HELP=1, start-up) for the prompt reads that follow: the
+    /// request's `prefill_help_frac` (0 = no help for it, up to 1), or a negative value for "not asked" (the rule and
+    /// STRATA_PREFILL_HELP_FRAC).  One value for the process: the last read's request sets it before it runs.
+    static void set_help_frac_request(double frac);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
