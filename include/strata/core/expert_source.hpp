@@ -23,6 +23,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/exchange_storage.hpp"
+#include "strata/core/pcie_balance.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -382,6 +383,10 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
+    /// --pcie-balance: this stage's cost estimates and switch.  When `balance->enabled`, `pcie_num`/256 is the UPPER
+    /// bound of the share (ceil of it) and the share per layer is chosen from the costs; otherwise (or null) the fixed
+    /// floor `nmiss * pcie_num / 256` applies.  The pool's time per expert is measured into it either way.
+    PcieBalance* balance = nullptr;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
