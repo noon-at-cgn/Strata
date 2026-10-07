@@ -2564,7 +2564,7 @@ void window_gpu_plan(const WindowGpuPlanInput& in, GpuPlanSink& P, int32_t* kind
         }
         ord_of[i] = o;
     }
-    const bool pcie_ok = in.pcie_num > 0 && in.pcie_layer;
+    const bool pcie_ok = in.pcie_num > 0 && in.pcie_layer && !P.no_pcie;
     // --pcie-balance: the share minimising max(PCIe copies, CPU pool) from the measured costs, never above --pcie-frac
     // (ceil) nor the staging slots; otherwise the fixed floor of --pcie-frac
     const int m = !pcie_ok ? 0
