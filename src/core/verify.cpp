@@ -620,9 +620,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
 #endif
-        if (!q8_on) {
-            std::fprintf(stderr, "strata: STRATA_HC_FUSED=1 needs STRATA_HC_Q8=1 (the BF16 read has no one-launch form): ignored\n");
-        } else if (cc_major < 7) {
+        if (cc_major < 7) {
             std::fprintf(stderr, "strata: STRATA_HC_FUSED=1 needs an NVIDIA card of compute capability 7.0 or newer: ignored\n");
         } else if (cudaMalloc((void**) &hcsync_, sizeof(unsigned) * strata::kernels::kFusedGrSyncWords) != cudaSuccess ||
                    cudaMemset(hcsync_, 0, sizeof(unsigned) * strata::kernels::kFusedGrSyncWords) != cudaSuccess) {
@@ -1439,6 +1437,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.rs = rs_ + t * HC;
                 a.inject_out = head_inj_;
                 a.mixed = head_mixed_ + t * N;
+                a.hc_sync = hcsync_;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
@@ -1454,6 +1453,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+                fa[t].hc_sync = hcsync_;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         } else {

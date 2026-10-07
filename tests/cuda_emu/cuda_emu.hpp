@@ -104,6 +104,7 @@ inline std::function<void()> g_body;
 inline unsigned long long g_switches = 0, g_since_done = 0;
 inline unsigned long long g_deadlock_switches = 200000000ull;   // switches without any fiber finishing: a deadlock
 inline unsigned long long g_cycles = 0;
+inline size_t g_dyn_bytes = 0;   // the launch's dynamic shared memory
 
 inline void yield() {
     ++g_switches; ++g_since_done;
@@ -173,9 +174,12 @@ inline void* smem_get(size_t bytes, int key) {
     return it->second.get();
 }
 
+inline void* smem_dyn() { return smem_get(g_dyn_bytes, -1); }
+
 enum class Order { Ascending, Descending, Shuffled };
 struct LaunchOpts {
     int resident = 8;                  // blocks on the "GPU" at once
+    size_t dyn_smem = 0;               // bytes of `extern __shared__` per block
     Order order = Order::Ascending;    // the order the hardware dispatches the blocks in
     unsigned seed = 1;
 };
@@ -183,6 +187,7 @@ struct LaunchOpts {
 /// Run `body` once per CUDA thread of a grid x block launch.  Returns when every block has finished.
 template <class F> void launch(dim3 grid, dim3 block, F body, const LaunchOpts& opt = {}) {
     g_blockDim = block; g_gridDim = grid;
+    g_dyn_bytes = opt.dyn_smem;
     g_body = [body]() mutable { body(); };
     const unsigned nblocks = grid.x * grid.y * grid.z, nthreads = block.x * block.y * block.z;
     std::vector<unsigned> idx(nblocks);
@@ -255,6 +260,7 @@ template <class F> void launch(dim3 grid, dim3 block, F body, const LaunchOpts& 
 #define gridDim (emu::g_gridDim)
 #define __syncthreads() emu::syncthreads()
 #define __threadfence() ((void) 0)
+#define STRATA_DYN_SHARED(type, name) type* name = static_cast<type*>(emu::smem_dyn())
 #define STRATA_SHARED(type, name, dims) \
     type(&name) dims = *reinterpret_cast<type(*) dims>(emu::smem_get(sizeof(type dims), __COUNTER__))
 
@@ -273,6 +279,8 @@ struct float4 { float x, y, z, w; };
 inline float4 make_float4(float x, float y, float z, float w) { return {x, y, z, w}; }
 struct uint2 { unsigned x, y; };
 struct uint4 { unsigned x, y, z, w; };
+inline uint4 make_uint4(unsigned x, unsigned y, unsigned z, unsigned w) { return {x, y, z, w}; }
+template <class T> inline T __ldg(const T* p) { return *p; }
 inline float __uint_as_float(unsigned u) { float f; std::memcpy(&f, &u, 4); return f; }
 struct half { uint16_t bits = 0; half() = default; half(float f) : bits(strata::kernels::f16_from_f32(f)) {} };
 struct half2 { half x, y; };

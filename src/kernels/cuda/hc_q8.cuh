@@ -242,31 +242,8 @@ constexpr int Q8_NRG = Q8_RG + 1;                  // 11 row groups: 10 of 32 do
 constexpr int Q8F_DOWN = Q8_NRG * Q8_NKC;          // 176 down tasks
 constexpr int Q8F_UP = UPM_BLOCKS;                 // 160 up tasks
 constexpr int Q8F_GRID = Q8F_DOWN + Q8F_UP;        // 336 blocks
-constexpr int SYNC_TICKET = 0, SYNC_DONE = 1, SYNC_READY = 2, SYNC_RG = 3;   // sync_[SYNC_RG + row group]
+constexpr int SYNC_READY = 2, SYNC_RG = 3;   // sync_[SYNC_RG + row group]; (SYNC_TICKET, SYNC_DONE: fused_gr_common.cuh)
 static_assert(SYNC_RG + Q8_NRG <= kFusedGrSyncWords, "the counters fit the words the caller allocates");
-
-__device__ __forceinline__ unsigned gr_ld_acquire(const unsigned* p) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(STRATA_CUDA_EMU)
-    unsigned v;
-    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-#else
-    return *reinterpret_cast<const volatile unsigned*>(p);
-#endif
-}
-__device__ __forceinline__ void gr_wait_ge(const unsigned* p, unsigned v) {
-#if defined(STRATA_CUDA_EMU)
-    emu::wait_until([&] { return gr_ld_acquire(p) >= v; });
-#else
-    const long long t0 = clock64();
-    while (gr_ld_acquire(p) < v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        __nanosleep(40);
-#endif
-        if (clock64() - t0 > 4000000000ll) __trap();   // a block that never started: fail loudly, not a hang
-    }
-#endif
-}
 
 template <int T>
 __device__ __forceinline__ void gr_q8f_down(const GrMulti& m, float* __restrict__ part, float* __restrict__ ssg,
@@ -525,18 +502,10 @@ __device__ __forceinline__ void gr_q8f_up(const GrMulti& m, const unsigned* sync
 // 136 resident blocks and the rest as those finish.  The ticket order below makes that safe.
 template <int T>
 __global__ void __launch_bounds__(THREADS, 2) gr_q8_fused_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg,
-                                                              unsigned* sync_) {
-    STRATA_SHARED(unsigned, ticket, );
-    if (threadIdx.x == 0) ticket = atomicAdd(&sync_[SYNC_TICKET], 1u);
-    __syncthreads();
-    const unsigned task = ticket;
+                                                                 unsigned* sync_) {
+    const unsigned task = gr_take_ticket(sync_);
     if (task < (unsigned) Q8F_DOWN) gr_q8f_down<T>(m, part, ssg, sync_, (int) (task % Q8_NRG), (int) (task / Q8_NRG));
     else gr_q8f_up<T>(m, sync_, (int) (task - Q8F_DOWN));
-    __syncthreads();
-    if (threadIdx.x == 0) {   // the last block out zeroes the counters for the next launch
-        __threadfence();
-        if (atomicAdd(&sync_[SYNC_DONE], 1u) == (unsigned) (Q8F_GRID - 1))
-            for (int i = 0; i < kFusedGrSyncWords; ++i) atomicExch(&sync_[i], 0u);
-    }
+    gr_retire(sync_, (unsigned) Q8F_GRID);
 }
 #endif   // !__HIPCC__
