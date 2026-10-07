@@ -70,6 +70,9 @@ inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv
 inline bool g_legacy_flagb() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_FLAGB"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }(); return on; }
 // S26 STRATA_QFUSE=1: activation q8_1 images written by their producers (the GDN output norm) - the same bytes
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+// STRATA_HC_FUSED=1: the hyper-connection read (BF16 or, with STRATA_HC_Q8=1, Q8_0) without redundant work and with its up weights
+// requested first; STRATA_HC_FUSED_ONE_LAUNCH=1 as one launch (fused_gr.hpp: hc_sync)
+inline bool g_hc_fused() { static const bool on = [] { const char* v = std::getenv("STRATA_HC_FUSED"); return v != nullptr && v[0] == '1'; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {
@@ -359,6 +362,7 @@ Verifier::~Verifier() {
     if (arena_b_) cudaFree(arena_b_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
+    if (hcsync_) cudaFree(hcsync_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -615,6 +619,33 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             qcnt_ = nullptr;
         }
     }
+    if (g_hc_fused()) {   // STRATA_HC_FUSED=1: the hyper-connection read's block counters, zeroed once (each launch leaves them zero)
+        const char* q8 = std::getenv("STRATA_HC_Q8");
+        const bool q8_on = q8 != nullptr && q8[0] == '1';
+        int cc_major = 0;
+#if !defined(STRATA_USE_HIP)
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+#endif
+        if (cc_major < 7) {
+            std::fprintf(stderr, "strata: STRATA_HC_FUSED=1 needs an NVIDIA card of compute capability 7.0 or newer: ignored\n");
+        } else if (cudaMalloc((void**) &hcsync_, sizeof(unsigned) * strata::kernels::kFusedGrSyncWords) != cudaSuccess ||
+                   cudaMemset(hcsync_, 0, sizeof(unsigned) * strata::kernels::kFusedGrSyncWords) != cudaSuccess) {
+            cudaGetLastError();
+            if (hcsync_) cudaFree(hcsync_);
+            hcsync_ = nullptr;
+            std::fprintf(stderr, "strata: STRATA_HC_FUSED=1: the counters could not be allocated: ignored\n");
+        } else if (!strata::kernels::fused_gr_fused_check(false) || (q8_on && !strata::kernels::fused_gr_fused_check(true))) {   // both forms: a layer or the head may still read the BF16 pack
+            cudaFree(hcsync_);
+            hcsync_ = nullptr;   // (the check says why)
+        } else {
+            std::fprintf(stderr, "strata: STRATA_HC_FUSED=1: the hyper-connection read (%s) runs with its reduction folded into the "
+                                 "down launch and the up launch's weights requested first%s\n",
+                         q8_on ? "Q8_0 projections" : "BF16 projections",
+                         std::getenv("STRATA_HC_FUSED_ONE_LAUNCH") != nullptr ? " (STRATA_HC_FUSED_ONE_LAUNCH set: one launch)" : "");
+        }
+    }
     if (all_resident_ || device_plan_) {
         bool ok2 = true;
         if (device_plan_)
@@ -824,6 +855,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
+                a.hc_sync = hcsync_;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
@@ -1405,6 +1437,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.q8_down = (const uint8_t*) hd->hc_q8; a.q8_up = (const uint8_t*) hu->hc_q8;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.mixed = head_mixed_ + t * N;
+                a.hc_sync = hcsync_;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
@@ -1423,6 +1456,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.rs = rs_ + t * HC;
                 a.inject_out = head_inj_;
                 a.mixed = head_mixed_ + t * N;
+                a.hc_sync = hcsync_;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
@@ -1438,6 +1472,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+                fa[t].hc_sync = hcsync_;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         } else {
