@@ -1234,6 +1234,14 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
   endif()
+  # Unsloth UD-Q4_K_XL's CPU expert rows (Q4_K gate/up, Q5_1 down): the kq256 / fast AVX-2 kernels and the engine's
+  # dispatch bit for bit against ggml-cpu's vec_dot at 1..8 tokens and partial row ranges (memcmp); --bench: GB/s per
+  # core and aggregate, the weights streamed from DRAM (run it on the CPU that runs the pool).  No GPU, no model.
+  add_executable(kq_fast_parity src/kernels/cpu/kq_fast_parity.cpp)
+  target_link_libraries(kq_fast_parity PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME kq_fast_parity COMMAND kq_fast_parity)
+  endif()
   # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
   add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
   target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
