@@ -788,7 +788,7 @@ room afterwards):
    visible under `/sys/fs/cgroup` (the group named in `/proc/self/cgroup`, or the deepest
    part of that path this mount shows): cgroup v2 `memory.max` and `memory.high`, each
    minus `memory.current`; cgroup v1 `memory.limit_in_bytes` minus
-   `memory.usage_in_bytes`. `max` and v1's "unlimited" count as no limit; a file that is
+   `memory.usage_in_bytes` (both less the clean inactive file cache, below). `max` and v1's "unlimited" count as no limit; a file that is
    absent (no memory controller at that level) is skipped; a file that is there but
    cannot be read or parsed makes the sample unknown, and unknown skips parking.
 3. `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB=N`; the flag wins, `0` = none):
@@ -803,19 +803,28 @@ room afterwards):
    `args` (`"--memory-limit-mib", "102400"`); the variable also works from the config's
    `"env"`.
 
-Usage is `memory.current` as the kernel reports it, **page cache included**. The kernel
-could reclaim some of that cache before it kills anything, so the figure can read low
-on a machine that has a lot of clean cache; it is not corrected for it, because
-pinned, locked and shared memory is charged to `memory.current` as well and cannot be
-given back, and a kill at a hard limit is worse than a skipped park. A parked
+Usage is `memory.current` as the kernel reports it, **less one reclaimable kind: clean
+inactive file cache**. That is the group's own `memory.stat` `inactive_file` (cgroup v1:
+`total_inactive_file`), less its dirty and writeback pages when `memory.stat` lists them
+(`file_dirty`, `file_writeback`; v1 `total_dirty`, `total_writeback`), and never more than
+`memory.current`. The kernel gives such pages back at `memory.high` or the limit before
+it kills anything, and a loaded model's file reads leave a lot of them behind. Nothing
+else is credited: `active_file` (it holds the mlocked pages), `shmem` (pinned expert
+complements, the KV pool) and anonymous memory stay charged in full, since a kill at a
+hard limit is worse than a skipped park. For each limit the room is
+`limit - (memory.current - credit)`, so it never exceeds the limit. A `memory.stat` that is missing or cannot be
+parsed gives no credit; it does not make the sample unknown. The operator's cap uses the
+`memory.stat` of the same top group whose `memory.current` it reads. A parked
 conversation is part of the engine's own usage once captured; the check before
 capture is what stops it from growing past the cap.
 
 The startup log has one line for it, `strata generate: memory guard: limit X GiB
-(source: flag|cgroup|meminfo), current Y GiB; available ... `, where `source` names the
+(source: flag|cgroup|meminfo), current Y GiB, reclaimable cache credited Z GiB;
+available ...`, where `source` names the
 number that was smallest at that moment (`meminfo`: MemTotal and `MemTotal -
 MemAvailable`), and a skipped park or a refused save/restore says how much it had and
-from which source. Without a cgroup limit and without `--memory-limit-mib` the figure is
+from which source. The line is printed before the model is loaded, so its credit is the
+cache at that moment, not at the time of a park. Without a cgroup limit and without `--memory-limit-mib` the figure is
 plain `MemAvailable`, as before. Unrelated to this figure: the startup sizing of the
 expert arena, the file tier's resident budget and the Windows commit check keep their
 own probes (`--resident-budget-gib`, #633).
@@ -825,9 +834,12 @@ is 100 GiB on the parent cgroup (outside the container's namespace), the contain
 own `memory.max` and `memory.high` read `max`, `/proc/meminfo` shows about 120 GiB
 `MemTotal` and about 25 GiB `MemAvailable` while the real headroom is about 1 GiB, and
 `/sys/fs/cgroup/memory.current` inside the container tracks the host's own figure
-(99.7 GiB there when the host showed 98.8). In one read of that container, most of
-`memory.current` (97.1 GiB) was pinned or shared memory (65.5 GiB `Shmem`, 26.8 GiB
-`Mlocked`, 13 MB of inactive file cache), so a cache credit would have changed little.
+(99.7 GiB there when the host showed 98.8). In one read of that container at steady
+state, most of `memory.current` (97.1 GiB) was pinned or shared memory (65.5 GiB `Shmem`,
+26.8 GiB `Mlocked`, 13 MB of inactive file cache). Right after the engine had loaded, the same container
+read `memory.current` 98.29 GiB with `anon` 1.29 GiB, `shmem` 65.51 GiB, `inactive_file`
+3.81 GiB (clean page cache left from reading the model files) and `active_file` 0.01 GiB:
+3.8 GiB of that is what the credit gives back.
 There `--memory-limit-mib 102400` is the cap, and the floor
 (`--conversation-cache-min-free-mib`) is measured against what is left under it: with
 the engine already near the cap, a floor of several GiB refuses every park; a few
