@@ -331,6 +331,64 @@ Tests (none needs a model):
   times the BF16 read, the Q8_0 read and the one-launch Q8_0 read in a graph of 96 reads the way a window runs them
   (about 150 MiB).
 
+## Measured on the dual RTX 3080 box (OptTune, 2026-10-07/08, branch `opt-tune-results`)
+
+UD-Q4_K_XL, 2 lanes x 256k, `--layer-split 23`, GPUs at 220 W, CT105 80 GiB then 90 GiB. One engine restart per arm.
+Metrics: `ab.py solo/c2/read` (each run as an A/A of the arm itself) and `read96.py` (unique 25k/51k/104k prompts).
+Decode tok/s varies about 10% between restarts of the same config (solo 76.7-86.0, c2 82-92.7), so decode arms need
+repeated ABAB restarts. Greedy text is not reproducible on this engine: the same config reaches 1-3 of 5 identical,
+and a frozen start (`--adapt-every 0`) still flips because `DraftPolicy` picks window sizes from wall-clock timings
+(use `--adapt-every 0 --suffix-draft 0` for byte checks).
+
+| Arm (on top of the previous production config) | read24k | 25k | 51k | 104k | solo / c2 | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| base (w5, `--prefill auto`, ple direct), 3 runs | 1402-1433 | 1413-1468 | 1711-1760 | 1881-1990 | 76.7-85.0 / 85.9-92.4 | reference |
+| `STRATA_AUX_STAGER=0` | 1393 | 1428-1473 | 1685-1745 | 1946-1959 | - | neutral |
+| `STRATA_STAGER_SLEEP=0` | 1415 | 1454-1472 | 1707-1752 | 1952-1968 | - | neutral |
+| `STRATA_MMVQ_IL=0` | 1410 | 1424-1465 | 1702-1736 | 1937-1963 | 76.1 / 83.4 | neutral |
+| strata-w2 + ple direct (pre-merge binary) | 1433 | 1458-1468 | 1720-1760 | 1941-1965 | 85.8 / 92.7 | = w5: the merge is not the slip |
+| 280 W instead of 220 W | 1443 | 1464-1484 | 1747-1772 | 1979-1999 | 86.0 / 92.2 | +2%, owner keeps 220 W |
+| `--prefill auto:12288` | 1430 | 1442-1467 | 1711-1742 | 1965-1990 | - | resolves to 8192: no-op |
+| `--prefill auto:16384` | 1604 | 1559-1611 | 1884-1962 | 2335-2361 | 77.4 / 84.3 | +10-21% |
+| `STRATA_SPLIT_RING=384` (8192 chunks) | 1347 | 1390-1463 | 1644-1724 | 1919-1954 | - | no gain |
+| `auto:16384` + `STRATA_SPLIT_RING=384` (shipped 01:50) | 1746-1791 | 1720-1785 | 2142-2251 | 2699-2801 | 78.8 / 86.3 | +23-39% |
+| + ring 512 | 1584 | 1610-1655 | 2010-2140 | 2693-2720 | - | worse |
+| + `--layer-split 24` | 1717 | 1707-1736 | 2138-2162 | 2646-2712 | 84.0 / 85.4 | -3%, keep 23 |
+| + `STRATA_IO_THREADS=64 --ple-inflight 1024` | 1728 | 1697-1773 | 2070-2213 | 2597-2724 | - | no gain |
+| + the same + w6b `STRATA_AUX_IO=float` | 1655 | 1510-1548 | 2017-2082 | 2511-2627 | 81.6 / 86.6 | prefill worse; stage-0 host staging 0.8 -> 0.17 ms/window |
+| + `STRATA_PREFILL_EQUAL=1` | 2035 | 2040-2101 | 2402-2477 | 2467-2774 | - | +10-16% up to 51k, 104k erratic (see below) |
+| strata-w7 without env (A) | 1751 | 1708-1776 | 2136-2202 | 2671-2706 | - | |
+| strata-w7 + `STRATA_SPLIT_MTP_BATCH=1` (B) | 1857 | 1798-1896 | 2212-2318 | 2725-2806 | 80.7 / 86.8 | +3-6%, draft acceptance 0.633 vs 0.635 |
+| w7 B + `STRATA_PREFILL_RING=384` (instead of SPLIT_RING) | 1864 | 1850-1878 | 2228-2320 | 2716-2746 | see ABAB | 0 file reads |
+| **w7 B + PREFILL_RING 384 + EQUAL + auto:16384 (shipped 05:55)** | **2170** | **2154-2221** | **2569-2626** | **2857-2872** | ABAB below | **shipped** |
+| the same with `auto:32768` (chunk 23296) | 2120 | 2141-2217 | 2648-2715 | 3002-3035 | - | MemAvailable 3.8 GiB at 90 GiB: no |
+
+Decode check for the shipped config, ABAB restarts (w7 B with SPLIT_RING 384, without EQUAL = A):
+A 81.2 / 84.2 and 78.2 / 75.8, B 82.4 / 89.6 and 79.5 / 80.8 (solo / c2 tok/s). Expert-cache hit rate is the same
+(86-89% median).
+RAM (memmix: 3 parked 18k-token conversations, a 127k read, c2 decode): MemAvailable min 11.2 GiB at the 90 GiB cap
+(old config: 11.2 GiB at 80 GiB). Parking works. `--memory-limit-mib 78000` turns parking off (the guard then sees
+0 MiB available), so keep 101376.
+
+Findings:
+- **`STRATA_SPLIT_RING` under-sizes the lent slots' RAM copies.** The lend regions are sized before the split's ring
+  override is applied: ring 384 at 16k gives 4662 kept vs 5396 borrowed. The rest stream from the GGUF mmap ('blob
+  reads from the file' 9-15k), and 104k reads become erratic (1284-2467 tok/s with EQUAL). `STRATA_PREFILL_RING`
+  is read on every call, so the sizing sees it. Code fix: strata-w9, branch `opt/06-lend-sizing`.
+- **With a layer split, `auto:32768` + EQUAL is not snapped to 16384.** The chunk becomes the largest one that
+  fits (23296) and lends 7713 slots (22.5 GiB of RAM copies).
+- **Prefill slip (~5% vs the pre-w5 numbers):** the w5 merge does not explain it (w2 + ple direct = w5), nor do
+  Stager sleep, aux stager, MMVQ_IL or PLE (`STRATA_PREFILL_TIMING` reports 'PLE 0 ms'). At 220 W the cards hit the
+  software power cap in 65-85% of prefill samples, at SM 1620-1725 MHz. The earlier numbers were taken at 280 W,
+  which is worth +2%. The remaining ~3% was not reproduced; `--ple-io ram` no longer fits in RAM to test it.
+- With 16k + ring 384, a chunk is compute-bound: wait copy fell from 41% to 0.3% of the GPU timeline. The largest
+  remaining items are gemm gate/up (13%), gdn (12-13%), hc read (10-12%), qsa attn (10%) and qsa proj (8-9%).
+
+Not run (queued in `~/tune/q34b.txt` on codebox): w6b `STRATA_AUX_IO` / `STRATA_SPLIT_COMMIT_ASYNC` /
+`STRATA_BATCH_PLE_LATE` decode arms and their frozen parity, `STRATA_DF_PLE`, `--pool-tasks 68/102`, `STRATA_HC_FUSED`
+/ `STRATA_HC_Q8`, `--mtp-draft-vocab` (en), `--mtp-q4 head`, `--spec 3/5`, `--vram-reserve-mib 1200`, `--kv-resident
+20480`, `--adapt-every 4`, w8 `STRATA_PARK_FAST`, per-request `pool_drain counters`.
+
 ## What this file does not claim
 
 No knob above (the dense-chain ones included: nothing was timed on a GPU for them) has a measured effect on tokens per second, latency or hit rate in this document. `--batch-overlap` is
