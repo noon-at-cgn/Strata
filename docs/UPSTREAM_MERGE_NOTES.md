@@ -123,7 +123,10 @@ upstream tests).
 - Named in the task: `hc_q8_parity` pass (the `w2-dense-fix` build failed it once with "STRATA_HC_FUSED BF16 read is NOT
   used: lo differs for 1 token" and passed on the repeat), `gr_parity` pass, `kq_fast_parity` (and its four env
   variants) pass, `pool_layer_test` (and its two env variants) pass, `draft_policy_test` (upstream's), `pool_tasks_test`,
-  `conversation_cache_test`, `memory_guard_test`, `verify_variant_test`, `expert_window_plan_test` pass.
+  `memory_guard_test`, `verify_variant_test`, `expert_window_plan_test` pass.
+- Built with `-DSTRATA_BUILD_CONVERSATION_TESTS=ON` (off by default; `conversation_cache_test` has a merged conflict):
+  `conversation_cache_test` (4729 checks), `_split_failure`, `_memory`, `_file`, `_validation`, `_transfer`, `_snapshot`
+  (needs a GPU) all pass.
 - `serve/` unit tests (`python -m unittest discover -s serve`, jinja2 + regex + Pillow): 591 tests OK, 11 skipped.
 
 ## Deployment layout (lm-server, nothing production touched)
