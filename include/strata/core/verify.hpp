@@ -366,7 +366,11 @@ private:
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
-    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
+    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err,
+                     bool late = false);   ///< late (STRATA_BATCH_PLE_LATE, run_slot_rows only): the PLE rows are prefetched, not gathered
+    std::vector<uint32_t> pend_ple_rows_;   ///< late: this window's PLE rows (S x PLE_N_HEADS) ...
+    size_t pend_ple_n_ = 0;                 ///< ... and how many tokens still wait for gather_pending_ple (0: none)
+    bool gather_pending_ple(std::string& err);   ///< gather them into h_ple_ with the fences the flag store needs; free when none
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;

@@ -2637,8 +2637,25 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     return true;
 }
 
+namespace {
+// STRATA_BATCH_PLE_LATE=1: a batch window's PLE rows are prefetched in stage_batch and gathered after the graph launch
+const bool g_batch_ple_late = env_on("STRATA_BATCH_PLE_LATE");
+}  // namespace
+
+bool Verifier::gather_pending_ple(std::string& err) {
+    if (pend_ple_n_ == 0) return true;
+    const Clock::time_point tp = Clock::now();
+    const size_t n = pend_ple_n_;
+    pend_ple_n_ = 0;
+    if (!ss_->ple.table->gather_batch(pend_ple_rows_.data(), n, h_ple_, err)) return false;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    ms_host += ms_since(tp);
+    return true;
+}
+
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                           std::string& err) {
+                           std::string& err, bool late) {
     using namespace strata::kernels;
     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
     // whose hand-off buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them)
@@ -2679,8 +2696,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
+    pend_ple_n_ = 0;
     if (ss_->ple.ready() && ple_stage()) {
-        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
+        uint32_t ple_rows_local[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
+        uint32_t* const ple_rows = late ? (pend_ple_rows_.resize((size_t) kVerifyMaxT * PLE_N_HEADS), pend_ple_rows_.data())
+                                        : ple_rows_local;
         for (int t = 0; t < S; ++t) {
             const SessionState& sx = *slots_[(size_t) rows[t]];
             int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
@@ -2690,7 +2710,14 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
         }
-        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+        if (late) {
+            // STRATA_BATCH_PLE_LATE: start the reads now (rows the slot drafters already prefetched are found again, no
+            // second read); the caller gathers them after the graph launch, before it raises layer 0's flag
+            for (int t = 0; t < S; ++t) ss_->ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+            pend_ple_n_ = (size_t) S;
+        } else if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) {
+            return false;
+        }
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.
@@ -2730,7 +2757,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
-    if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (!stage_batch(rows, S, 0, tokens, pos, err, g_batch_ple_late)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -2747,6 +2774,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     // graph waits on host doorbells the skipped service never raises (GPU at 100%, host in the sync below).
     if (ar_on()) {
         if (ss_->ple.ready() && ple_stage()) {
+            if (!gather_pending_ple(err)) return false;   // (nothing pending unless STRATA_BATCH_PLE_LATE)
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
@@ -2809,6 +2837,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             raise_b(want);
         }
         if (!plan_fits_graph(err)) return false;
+        // STRATA_BATCH_PLE_LATE: layer 1's pre copies h_ple_ after layer 0's wait for this flag (as run() gathers here)
+        if (k == 0 && !gather_pending_ple(err)) return false;
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);

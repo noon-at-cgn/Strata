@@ -205,6 +205,7 @@ struct PleTable::Impl {
     uint64_t n_rows = 0;
     const PleFormatInfo* fmt = &ple_format_info(PleFormat::IQ4_NL);   // the table's format (#296: Q5_0 is one of them)
     mutable uint64_t bytes_read = 0;
+    uint64_t ticket_gathers = 0;      // gather_batch calls served by the prefetch tickets
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
@@ -434,6 +435,7 @@ void PleTable::close() {
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
     impl_->bytes_read = 0;
+    impl_->ticket_gathers = 0;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -526,6 +528,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
                     }
                 }
                 impl_->n_prefetch = 0;
+                ++impl_->ticket_gathers;
                 for (size_t t = 0; t < n_tokens; ++t) {
                     for (int h = 0; h < PLE_N_HEADS; ++h) {
                         impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb,
@@ -548,6 +551,8 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
 }
+
+uint64_t PleTable::ticket_gathers() const { return impl_->ticket_gathers; }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
 

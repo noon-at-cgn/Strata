@@ -239,6 +239,75 @@ void all_formats_round_trip(const std::string& dir) {
     }
 }
 
+/// STRATA_BATCH_PLE_LATE: the batch window's rows are prefetched (Verifier::stage_batch) and gathered later.  Rows of N
+/// tokens (N x 16) prefetched with prefetch_rows and then gathered with gather_batch must give the bytes of a cold
+/// gather_batch of the same rows on a fresh table, and must be answered by the prefetch tickets (ticket_gathers), not
+/// by a second reader request.  A prefetch list that does not start with the gathered rows (a drafter's rows ahead of
+/// them) falls back to the cold read: same bytes, no ticket gather.
+void prefetch_then_gather(const std::string& dir) {
+    for (int i = 0; i < k::ple_format_count(); ++i) {
+        const k::PleFormatInfo& f = k::ple_formats()[i];
+        const uint32_t rows_in_table = 4000;
+        const std::string path = write_format_table(dir, f, rows_in_table);
+        if (path.empty()) { CHECK(false, "%s: no table was written", f.name); return; }
+        constexpr int NT = 4;
+        std::mt19937 rng(21);
+        uint32_t rows[NT * 16];
+        for (uint32_t& r : rows) r = rng() % rows_in_table;
+        auto open = [&](k::PleTable& t) {
+            std::string err;
+            k::PleIoOptions io;
+            io.mode = k::PleIo::Direct;
+            io.max_inflight = 64;
+            io.cache_rows = 0;
+            CHECK(t.open(path, err, io), "%s: open: %s", f.name, err.c_str());
+        };
+        const size_t n_floats = (size_t) NT * 16 * k::PLE_HEAD_DIM;
+        std::vector<float> cold(n_floats), warm(n_floats), other(n_floats), ref(n_floats);
+        std::string err;
+        {   // the oracle: each row through its format's own dequantizer
+            std::vector<uint8_t> raw(f.row_bytes);
+            for (int r = 0; r < NT * 16; ++r) {
+                expected_row(rows[r], f.row_bytes, raw.data());
+                f.dequant(raw.data(), f.needs_scale ? 0.75f : 1.0f, ref.data() + (size_t) r * k::PLE_HEAD_DIM);
+            }
+        }
+        k::PleTable t_cold;
+        open(t_cold);
+        CHECK(t_cold.gather_batch(rows, NT, cold.data(), err), "%s: cold gather_batch: %s", f.name, err.c_str());
+        CHECK(t_cold.ticket_gathers() == 0, "%s: a cold gather_batch counted as a ticket gather", f.name);
+        CHECK(std::memcmp(cold.data(), ref.data(), n_floats * 4) == 0, "%s: the cold gather differs from the dequantizer", f.name);
+
+        k::PleTable t_warm;
+        open(t_warm);
+        for (int t = 0; t < NT; ++t) t_warm.prefetch_rows(rows + t * 16);
+        for (int t = 0; t < NT; ++t) t_warm.prefetch_rows(rows + t * 16);   // a repeat is found again: no second read
+        CHECK(t_warm.gather_batch(rows, NT, warm.data(), err), "%s: gather_batch after prefetch: %s", f.name, err.c_str());
+        CHECK(t_warm.ticket_gathers() == 1, "%s: the gather after prefetch_rows took the cold path (ticket_gathers %llu)", f.name,
+              (unsigned long long) t_warm.ticket_gathers());
+        CHECK(std::memcmp(warm.data(), cold.data(), n_floats * 4) == 0, "%s: prefetched gather bytes differ from the cold gather", f.name);
+
+        // the tickets are used up: the same rows again are a cold read, with the same bytes
+        CHECK(t_warm.gather_batch(rows, NT, other.data(), err), "%s: second gather_batch: %s", f.name, err.c_str());
+        CHECK(t_warm.ticket_gathers() == 1, "%s: a gather without a prefetch counted as a ticket gather", f.name);
+        CHECK(std::memcmp(other.data(), cold.data(), n_floats * 4) == 0, "%s: second gather bytes differ", f.name);
+
+        // a different prefetch ahead of the rows (a drafter's): no ticket gather, still the right bytes
+        k::PleTable t_mis;
+        open(t_mis);
+        uint32_t stale[16];
+        for (uint32_t& r : stale) r = rng() % rows_in_table;
+        t_mis.prefetch_rows(stale);
+        for (int t = 0; t < NT; ++t) t_mis.prefetch_rows(rows + t * 16);
+        std::fill(other.begin(), other.end(), 0.0f);
+        CHECK(t_mis.gather_batch(rows, NT, other.data(), err), "%s: misaligned gather_batch: %s", f.name, err.c_str());
+        CHECK(t_mis.ticket_gathers() == 0, "%s: a misaligned prefetch list took the ticket path", f.name);
+        CHECK(std::memcmp(other.data(), cold.data(), n_floats * 4) == 0, "%s: misaligned gather bytes differ", f.name);
+        std::filesystem::remove(path);
+    }
+    if (g_fail == 0) std::printf("ple prefetch_rows then gather_batch: same bytes as a cold gather, served by the prefetch tickets: OK\n");
+}
+
 // row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (#296, OrcaRouter's Q5_0 PLE rows) is
 // run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
 // size run here is the correctness evidence for lifting ngram.cpp's "Q5_0 PLE requires --ple-io mmap" refusal.
@@ -456,6 +525,8 @@ int main(int argc, char** argv) {
         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer
+        if (g_fail != 0) return 1;
+        prefetch_then_gather(dir);                 // STRATA_BATCH_PLE_LATE's contract: prefetch, then gather the same rows
         if (g_fail != 0) return 1;
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, 110);
