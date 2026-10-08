@@ -1,6 +1,7 @@
 #include "strata/core/conversation_memory.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <charconv>
 #include <filesystem>
@@ -16,6 +17,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
+
+#if defined(__GLIBC__)
+#include <malloc.h>
 #endif
 
 namespace strata::core {
@@ -251,6 +256,60 @@ std::optional<uint64_t> conversation_mem_available(std::istream& meminfo) {
     return meminfo_kb_bytes(meminfo, "MemAvailable:");
 }
 
+
+namespace {
+std::atomic<uint64_t> g_retain_cap_bytes{0};
+constexpr uint64_t kRetainMin = 64ull << 20, kRetainMax = 1536ull << 20;   // mallopt's thresholds are ints: 1.25 x cap < 2 GiB
+}
+
+bool conversation_retain_freed_memory(uint64_t retain_bytes, bool all_threads, std::string& note) {
+    if (retain_bytes == 0) { note = "STRATA_PARK_FAST: retention 0 MiB, left alone"; return false; }
+#if defined(__GLIBC__)
+    const uint64_t cap = std::min(std::max(retain_bytes, kRetainMin), kRetainMax);
+    const uint64_t trim = cap + cap / 4;
+    // each call also turns glibc's dynamic mmap/trim threshold adjustment off; a thread other than main has its own
+    // arena, which ignores all of it, unless there is only one arena
+    const bool ok = (!all_threads || mallopt(M_ARENA_MAX, 1) == 1) && mallopt(M_MMAP_MAX, 0) == 1 &&
+                    mallopt(M_TOP_PAD, (int) cap) == 1 && mallopt(M_TRIM_THRESHOLD, (int) trim) == 1;
+    if (!ok) { note = "STRATA_PARK_FAST: mallopt refused, left as it was"; return false; }
+    g_retain_cap_bytes.store(cap, std::memory_order_relaxed);
+    note = std::string("STRATA_PARK_FAST=") + (all_threads ? "2" : "1") +
+           ": big allocations come from the heap (M_MMAP_MAX=0" + (all_threads ? ", M_ARENA_MAX=1: every thread" : ": main thread only") +
+           ") and freed memory stays up to " + std::to_string(cap >> 20) + " MiB at the top (M_TOP_PAD=" +
+           std::to_string(cap) + ", M_TRIM_THRESHOLD=" + std::to_string(trim) +
+           "); process-wide, so parking, checkpoints and slot moves reuse faulted-in pages";
+    return true;
+#else
+    note = "STRATA_PARK_FAST: needs glibc's allocator, left alone";
+    return false;
+#endif
+}
+
+bool conversation_retain_freed_memory_from_env(std::string& note) {
+    note.clear();
+    const char* on = std::getenv("STRATA_PARK_FAST");
+    const int level = on == nullptr ? 0 : std::atoi(on);
+    if (level <= 0) return false;
+    uint64_t mib = 1024;
+    if (const char* v = std::getenv("STRATA_PARK_FAST_RETAIN_MIB")) {
+        const long long n = std::atoll(v);
+        if (n > 0) mib = std::min<uint64_t>((uint64_t) n, 1u << 20);
+    }
+    return conversation_retain_freed_memory(mib << 20, level >= 2, note);
+}
+
+uint64_t conversation_retained_cap_bytes() { return g_retain_cap_bytes.load(std::memory_order_relaxed); }
+
+uint64_t conversation_retained_free_bytes() {
+    const uint64_t cap = conversation_retained_cap_bytes();
+    if (cap == 0) return 0;
+#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 33)
+    return std::min<uint64_t>(cap, (uint64_t) mallinfo2().fordblks);
+#else
+    return 0;
+#endif
+}
+
 void set_memory_limit_bytes(uint64_t bytes) { g_memory_limit_bytes.store(bytes, std::memory_order_relaxed); }
 uint64_t memory_limit_bytes() { return g_memory_limit_bytes.load(std::memory_order_relaxed); }
 
@@ -274,7 +333,16 @@ std::optional<HostMemoryReading> sample_host_memory() {
     if (!GlobalMemoryStatusEx(&status)) return {};
     return combine(status.ullAvailPhys, status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
 #elif defined(__linux__)
-    return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+    auto reading = sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+    // STRATA_PARK_FAST: the heap's retained free pages are charged to this process but the next copy reuses them
+    if (reading) {
+        const uint64_t retained = conversation_retained_free_bytes();
+        if (retained != 0) {
+            const uint64_t room = reading->limit > reading->available ? reading->limit - reading->available : 0;
+            reading->available += std::min(retained, room);
+        }
+    }
+    return reading;
 #else
     return {};
 #endif

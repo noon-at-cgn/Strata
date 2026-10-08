@@ -71,4 +71,31 @@ inline bool conversation_memory_admit(std::optional<uint64_t> available,
     return available && *available >= floor && allocation <= *available - floor;
 }
 
+// STRATA_PARK_FAST=1|2 (opt-in, default off; glibc only).  Parking a conversation, saving a checkpoint and moving a
+// conversation into a batch slot copy a few hundred MB into freshly allocated host vectors; the cost of that copy is the
+// first-touch page faults of the new memory (~1.5 GB/s), not the bytes moved.  A freed 237 MB vector goes back to the
+// kernel (glibc mmaps big blocks and munmaps them on free), so every copy pays the faults again.  Armed, the process
+// takes its big blocks from the brk heap and keeps up to `retain_bytes` of freed memory (M_MMAP_MAX=0, M_TOP_PAD,
+// M_TRIM_THRESHOLD), and the next copy lands on pages that are already faulted in.  PROCESS-WIDE: every large
+// allocation made after the call is affected, not only the parking ones; call it once, after the model is loaded
+// (memory that is cudaHostRegister'ed must keep its own mapping).  Returns false (and changes nothing) when `retain_bytes`
+// is 0 or the allocator is not glibc's.  `retain_bytes` is clamped to [64 MiB, 1.5 GiB] (mallopt takes an int).
+// glibc gives every other thread its own arena, and an arena that is not the main one ignores all of this (a big block
+// there is still mmap'ed and munmap'ed): `all_threads` (STRATA_PARK_FAST=2) also sets M_ARENA_MAX=1 so that the stage
+// threads' checkpoint parts and every other thread share the main arena (one malloc lock for the whole process).
+bool conversation_retain_freed_memory(uint64_t retain_bytes, bool all_threads, std::string& note);
+
+// The environment form: STRATA_PARK_FAST=1 arms it for the allocations of the main thread (the request loop: parks,
+// checkpoints and slot moves), =2 for every thread, with STRATA_PARK_FAST_RETAIN_MIB (default 1024).  Returns whether
+// it armed; `note` says what happened (empty when STRATA_PARK_FAST is unset or 0, nothing was touched).
+bool conversation_retain_freed_memory_from_env(std::string& note);
+
+// The retention cap armed above, 0 when not armed.
+uint64_t conversation_retained_cap_bytes();
+
+// Free bytes the armed heap holds and a park can reuse without a new page (glibc mallinfo2 fordblks, at most the cap);
+// 0 when not armed.  sample_host_memory() adds it to `available`: the retained pages are not free for the kernel, but
+// they are free for the engine's own next copy, so the park admission must not count them against itself.
+uint64_t conversation_retained_free_bytes();
+
 } // namespace strata::core

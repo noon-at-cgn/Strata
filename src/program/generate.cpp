@@ -7236,6 +7236,15 @@ int main(int argc, char** argv) {
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // STRATA_PARK_FAST=1|2 (opt-in; default off, nothing below runs without it): park / checkpoint / slot-move copies
+        // are bound by first-touch page faults of fresh host vectors, so keep freed big blocks faulted-in (glibc mallopt,
+        // PROCESS-WIDE).  After the model and the pinned arenas are loaded: their cudaHostRegister'ed ranges keep their mmap.
+        {
+            std::string park_fast_note;
+            const bool armed = strata::core::conversation_retain_freed_memory_from_env(park_fast_note);
+            if (!park_fast_note.empty())
+                std::fprintf(stderr, "strata serve: %s%s\n", park_fast_note.c_str(), armed ? "" : " (not armed)");
+        }
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
