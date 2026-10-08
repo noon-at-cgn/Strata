@@ -203,6 +203,11 @@ public:
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
     static void set_commit_async(bool on);
+    /// STRATA_SPLIT_COMMIT_ASYNC=1 (read once, default off): the same on a layer split, solo windows (commit() on every
+    /// stage returns without waiting) and batch windows (commit_slot_prefixes launches every stage's commit graph and
+    /// returns; the next stage_batch waits for it before it rewrites the staging the graph reads).  `wait_commit`
+    /// covers both.  A faulting commit kernel then shows at the next window's sync.
+    static bool split_commit_async();
     /// Bytes of page-locked mapped host memory the verifiers have allocated so far (their staging and flag words); the
     /// difference across an init() is what that verifier pinned.
     static size_t mapped_bytes();
@@ -287,6 +292,7 @@ public:
     bool pcie_off() const { return pcie_off_; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_commit_wait = 0;   ///< batch windows, STRATA_SPLIT_COMMIT_ASYNC: host time in the waits for the previous window's commit
     int64_t windows = 0;
     /// STRATA_SPLIT_TIMING: how long the host took from seeing each layer's doorbell to raising flag A, over every layer
     /// served since the start (a request's numbers: `door_lat.since(copy taken at its start)`)
@@ -315,6 +321,8 @@ private:
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     bool commit_prefix_launch(const int* keep, std::string& err);   ///< commit_slot_prefixes' host setup and graph launch
     bool commit_prefix_finish(const int* keep, std::string& err);   ///< ... its sync, then the PLE history
+    bool commit_prefix_record(const int* keep, std::string& err);   ///< STRATA_SPLIT_COMMIT_ASYNC: an event after the launch, no sync
+    void commit_prefix_ple(const int* keep);                        ///< the host's side of a batch commit (the PLE history)
     std::chrono::steady_clock::time_point commit_t0_{};
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
@@ -469,6 +477,9 @@ private:
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
+    cudaEvent_t commitb_done_ = nullptr;  // recorded after an async batch commit (STRATA_SPLIT_COMMIT_ASYNC); see wait_commit
+    bool commitb_pending_ = false;
+    bool wait_commit_batch(std::string& err);   ///< this stage only: the event wait, counted in ms_commit_wait
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

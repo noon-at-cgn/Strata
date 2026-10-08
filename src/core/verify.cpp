@@ -375,6 +375,7 @@ Verifier::~Verifier() {
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (commit_done_) cudaEventDestroy(commit_done_);
+    if (commitb_done_) cudaEventDestroy(commitb_done_);
     if (ev_done_) cudaEventDestroy(ev_done_);
     if (ev_commit_) cudaEventDestroy(ev_commit_);
     if (prof_pin_) cudaFreeHost(prof_pin_);
@@ -590,6 +591,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&commitb_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
@@ -2337,7 +2339,13 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
-namespace { bool g_commit_async = false; }
+namespace {
+bool g_commit_async = false;
+// STRATA_SPLIT_COMMIT_ASYNC=1: the commits of a layer split's stages do not wait either (solo: commit(); batch:
+// commit_slot_prefixes).  STRATA_COMMIT_SYNC=1 still wins.
+const bool g_split_commit_async = env_on("STRATA_SPLIT_COMMIT_ASYNC") && std::getenv("STRATA_COMMIT_SYNC") == nullptr;
+}  // namespace
+bool Verifier::split_commit_async() { return g_split_commit_async; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 size_t Verifier::mapped_bytes() { return g_mapped_bytes.load(); }
 
@@ -2357,7 +2365,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        if (!g_commit_async || (next_ != nullptr && !g_split_commit_async)) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -2383,7 +2391,19 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
+    if (!wait_commit_batch(err)) return false;
     return next_ == nullptr || next_->wait_commit(err);
+}
+
+bool Verifier::wait_commit_batch(std::string& err) {
+    if (!commitb_pending_) return true;
+    const OnDevice on_device(device_);
+    commitb_pending_ = false;
+    const Clock::time_point t0 = Clock::now();
+    const cudaError_t se = cudaEventSynchronize(commitb_done_);
+    ms_commit_wait += ms_since(t0);
+    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+    return true;
 }
 
 
@@ -2628,6 +2648,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         return false;
     }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    // STRATA_SPLIT_COMMIT_ASYNC: the previous window's commit graph may still read h_commitb_ (rewritten below) and run
+    // on a graph a capture below may evict; it has long finished (it ran under the slot drafts), so this is a query
+    if (!wait_commit_batch(err)) return false;
     const ModelGeometry& g = *g_;
     for (int t = 0; t < S; ++t)
         if (pos[t] < 0 || pos[t] + 1 > slots_[(size_t) rows[t]]->max_cells) {
@@ -2817,6 +2840,23 @@ void Verifier::set_batch_overlap(bool on) { g_batch_overlap.store(on, std::memor
 bool Verifier::batch_overlap() { return g_batch_overlap.load(std::memory_order_relaxed); }
 
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
+    if (next_ != nullptr && g_split_commit_async) {
+        // STRATA_SPLIT_COMMIT_ASYNC: every stage's graph launched, none waited for.  Each stage's graph runs on its own
+        // stream behind that stage's window; the next stage_batch (and every wait_commit) waits on its event before it
+        // touches what the graph reads.  The host's side of the commit (the PLE history) needs no GPU result.
+        int launched = 0;
+        bool ok = true;
+        for (Verifier* v = this; v != nullptr; v = v->next_) {
+            if (!v->commit_prefix_launch(keep, err)) { ok = false; break; }
+            ++launched;
+        }
+        Verifier* v = this;
+        for (int i = 0; i < launched; ++i, v = v->next_) {
+            std::string e2;
+            if (!v->commit_prefix_record(keep, e2) && ok) { ok = false; err = e2; }
+        }
+        return ok;
+    }
     if (!batch_overlap()) {   // each stage in turn: launch, sync, then the next stage
         if (!commit_prefix_launch(keep, err) || !commit_prefix_finish(keep, err)) return false;
         return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
@@ -2865,11 +2905,8 @@ bool Verifier::commit_prefix_launch(const int* keep, std::string& err) {
     return true;
 }
 
-bool Verifier::commit_prefix_finish(const int* keep, std::string& err) {
-    const OnDevice on_device(device_);
+void Verifier::commit_prefix_ple(const int* keep) {
     const int S = last_t_;
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
     if (ple_stage())
         for (int t = 0; t < S;) {
             const int first = t;
@@ -2880,6 +2917,24 @@ bool Verifier::commit_prefix_finish(const int* keep, std::string& err) {
                 sx.ple_prev[1] = last_tokens_[u];
             }
         }
+}
+
+bool Verifier::commit_prefix_finish(const int* keep, std::string& err) {
+    const OnDevice on_device(device_);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+    commit_prefix_ple(keep);
+    ms_commit += ms_since(commit_t0_);
+    return true;
+}
+
+bool Verifier::commit_prefix_record(const int* keep, std::string& err) {
+    const OnDevice on_device(device_);
+    const cudaError_t re = cudaEventRecord(commitb_done_, cs_);
+    if (re != cudaSuccess) { err = std::string("verify: batch commit event: ") + cudaGetErrorString(re); return false; }
+    (void) cudaStreamQuery(cs_);
+    commitb_pending_ = true;
+    commit_prefix_ple(keep);
     ms_commit += ms_since(commit_t0_);
     return true;
 }
