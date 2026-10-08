@@ -7553,11 +7553,38 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
+        // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
+        // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
+        static const bool split_mtp_batch = [] {
+            const char* v = std::getenv("STRATA_SPLIT_MTP_BATCH");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
-            const bool batched = use_mtp && !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+            // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
+            bool batched = false;
+            if (use_mtp && (!multi_gpu || split_mtp_batch)) {
+                strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
+                const char* why = nullptr;
+                if (multi_gpu && strata::core::native_embed() == nullptr)
+                    why = "the split's last stage has no GGUF-form token embedding table (not --native)";
+                else
+                    batched = dsp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e, &why);
+                if (multi_gpu) {   // once per process: what this env did
+                    static bool said = false;
+                    if (!said && (batched || (e.empty() && why != nullptr))) {
+                        said = true;
+                        if (batched)
+                            std::fprintf(stderr, "strata serve: draft layer prompt K/V batched on CUDA%d (E-9 on the layer "
+                                                 "split, K/V mode %d)\n", stages.back()->dev, mtp.kv_state().kv_mode);
+                        else
+                            std::fprintf(stderr, "strata serve: STRATA_SPLIT_MTP_BATCH=1 declined, the drafter's own pass "
+                                                 "runs: %s\n", why);
+                    }
+                }
+            }
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
