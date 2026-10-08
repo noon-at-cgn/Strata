@@ -127,10 +127,14 @@ inline std::vector<int> restrict_list(const std::vector<int>& list, const std::v
 }
 
 /// What `--aux-cpus` / STRATA_AUX_CPUS said.  `on`: placed from the start-up; `use_list`: the list, not `auto`.
+/// `io_*`: what STRATA_AUX_IO said (the I/O threads: PLE reader, O_DIRECT pread pools, prompt PLE gather).
 struct Config {
     bool on = false;
     bool use_list = false;
     std::vector<int> list;
+    bool io_on = false;
+    bool io_float = false;
+    std::vector<int> io_list;
 };
 
 /// "" and "off": off at start (a request can still turn it on with `auto`); "auto"; or a CPU list.
@@ -147,6 +151,33 @@ inline bool parse_spec(const std::string& spec, Config& cfg, std::string& err) {
     return true;
 }
 
+/// STRATA_AUX_IO: "" and "off": unset (the I/O threads follow --aux-cpus like every helper); "float": every CPU the
+/// process may use but the host's; or a CPU list.  Fills the `io_*` fields of `cfg` only.
+inline bool parse_io_spec(const std::string& spec, Config& cfg, std::string& err) {
+    cfg.io_on = cfg.io_float = false;
+    cfg.io_list.clear();
+    if (spec.empty() || spec == "off") return true;
+    if (spec == "float") { cfg.io_on = cfg.io_float = true; return true; }
+    if (!parse_cpu_list(spec, cfg.io_list)) {
+        err = "STRATA_AUX_IO takes float or a CPU list such as 26,30 or 26-27 (got '" + spec + "')";
+        return false;
+    }
+    cfg.io_on = true;
+    return true;
+}
+
+/// The CPUs the I/O threads may use: `allowed` (float) or the list restricted to `allowed`, without the host's CPU.
+/// Workers' CPUs are allowed on purpose (the I/O threads sleep in pread almost all the time).
+inline std::vector<int> io_cpus(const Config& cfg, const std::vector<int>& allowed, int host_cpu) {
+    std::vector<int> out;
+    if (!cfg.io_on) return out;
+    for (int c : allowed) {
+        if (c == host_cpu) continue;
+        if (cfg.io_float || std::find(cfg.io_list.begin(), cfg.io_list.end(), c) != cfg.io_list.end()) out.push_back(c);
+    }
+    return out;
+}
+
 #if defined(__linux__)
 
 namespace detail {
@@ -157,12 +188,17 @@ struct State {
     std::atomic<bool> enabled{false};
     std::atomic<bool> have_plan{false};
     std::vector<int> allowed;                     ///< the process's CPUs, snapshotted before any thread is pinned
+    bool io_active = false;                       ///< STRATA_AUX_IO is on and has a non-empty target
+    std::vector<int> io_plan;                     ///< the CPUs of the I/O threads (valid once `io_planned`)
+    bool io_planned = false;
+    cpu_set_t io_target;
+    std::set<int> io_tids;                        ///< tids of the I/O threads placed by pin_current_io_thread()
     std::vector<int> plan;                        ///< the aux CPUs (empty: nothing to do)
     std::vector<int> workers;                     ///< the pool's CPUs: their threads are never touched
     cpu_set_t target;
     std::set<int> owned;                          ///< tids of pool workers and host threads
     std::map<int, cpu_set_t> original;            ///< tid -> the mask it had before this module moved it
-    State() { CPU_ZERO(&target); }
+    State() { CPU_ZERO(&target); CPU_ZERO(&io_target); }
 };
 
 inline State& state() {
@@ -209,19 +245,27 @@ inline std::vector<int> task_ids() {
 inline void purge_locked(State& s) {
     for (auto it = s.original.begin(); it != s.original.end();) it = alive(it->first) ? std::next(it) : s.original.erase(it);
     for (auto it = s.owned.begin(); it != s.owned.end();) it = alive(*it) ? std::next(it) : s.owned.erase(it);
+    for (auto it = s.io_tids.begin(); it != s.io_tids.end();) it = alive(*it) ? std::next(it) : s.io_tids.erase(it);
 }
 
 }  // namespace detail
 
-/// Reads the CPUs the calling thread may use and the spec.  Call once, early, on the thread that has not been pinned
-/// yet (the engine's main thread, before the pool exists).  The main thread counts as the host.
-inline bool configure(const std::string& spec, std::string& err) {
+/// Reads the CPUs the calling thread may use, the spec and the I/O spec (`io_spec`; STRATA_AUX_IO when the overload
+/// without it is used).  Call once, early, on the thread that has not been pinned yet (the engine's main thread, before
+/// the pool exists).  The main thread counts as the host.
+inline bool configure(const std::string& spec, const std::string& io_spec, std::string& err) {
     detail::State& s = detail::state();
     Config cfg;
     if (!parse_spec(spec, cfg, err)) return false;
+    if (!parse_io_spec(io_spec, cfg, err)) return false;
     std::lock_guard<std::mutex> lk(s.mu);
     s.cfg = cfg;
     s.allowed.clear();
+    s.io_tids.clear();
+    s.io_plan.clear();
+    s.io_planned = false;
+    s.io_active = false;
+    CPU_ZERO(&s.io_target);
     cpu_set_t now;
     CPU_ZERO(&now);
     if (sched_getaffinity(0, sizeof now, &now) == 0)
@@ -229,6 +273,11 @@ inline bool configure(const std::string& spec, std::string& err) {
             if (CPU_ISSET(c, &now)) s.allowed.push_back(c);
     s.owned.insert(detail::self_tid());
     return true;
+}
+
+inline bool configure(const std::string& spec, std::string& err) {
+    const char* io = std::getenv("STRATA_AUX_IO");
+    return configure(spec, io != nullptr ? std::string(io) : std::string(), err);
 }
 
 /// The calling thread belongs to the pool or is the host: the sweep leaves it alone.
@@ -258,6 +307,33 @@ inline void pin_current_thread() {
     std::lock_guard<std::mutex> lk(s.mu);
     const int tid = detail::self_tid();
     if (s.owned.find(tid) == s.owned.end()) detail::move_locked(s, tid);
+}
+
+/// First thing an I/O thread (PLE reader, O_DIRECT pread pool, the prompt's PLE gather) does.  Without STRATA_AUX_IO it
+/// is exactly `pin_current_thread()`.  With it the thread runs on the I/O CPUs, whatever --aux-cpus says, and the sweep
+/// and `restore()` never touch it.
+inline void pin_current_io_thread() {
+    detail::State& s = detail::state();
+    {
+        std::lock_guard<std::mutex> lk(s.mu);
+        if (s.cfg.io_on && (s.io_active || !s.io_planned)) {
+            if (s.io_tids.size() >= 32) detail::purge_locked(s);   // the prompt's gather threads come and go per chunk
+            const int tid = detail::self_tid();
+            s.owned.insert(tid);
+            s.io_tids.insert(tid);
+            s.original.erase(tid);           // a sweep that got here first: restore() must not undo the I/O placement
+            cpu_set_t all;
+            const cpu_set_t* target = &s.io_target;
+            if (!s.io_planned) {             // before set_topology: the host's CPU is not known yet; set_topology fixes it
+                CPU_ZERO(&all);
+                for (int c : s.allowed) CPU_SET(c, &all);
+                target = &all;
+            }
+            if (CPU_COUNT(target) > 0) (void) sched_setaffinity(0, sizeof *target, target);
+            return;
+        }
+    }
+    pin_current_thread();                    // STRATA_AUX_IO unset (or planned empty, i.e. off): the ordinary rules
 }
 
 /// Puts back the placement every moved thread had.  Returns how many were restored.
@@ -316,7 +392,7 @@ inline std::vector<LogicalCpu> read_topology(const std::vector<int>& cpus) {
 inline std::string set_topology(int host_cpu, const std::vector<int>& worker_cpus) {
     detail::State& s = detail::state();
     std::vector<int> plan;
-    std::string note;
+    std::string note, io_note;
     {
         std::lock_guard<std::mutex> lk(s.mu);
         const std::vector<LogicalCpu> allowed = read_topology(s.allowed);
@@ -328,6 +404,28 @@ inline std::string set_topology(int host_cpu, const std::vector<int>& worker_cpu
         for (int c : plan) CPU_SET(c, &s.target);
         s.have_plan.store(!plan.empty(), std::memory_order_release);
         for (size_t i = 0; i < plan.size(); ++i) note += (i ? "," : "") + std::to_string(plan[i]);
+        if (s.cfg.io_on) {
+            s.io_plan = io_cpus(s.cfg, s.allowed, host_cpu);
+            CPU_ZERO(&s.io_target);
+            for (int c : s.io_plan) CPU_SET(c, &s.io_target);
+            s.io_planned = true;
+            s.io_active = !s.io_plan.empty();
+            if (s.io_active) {
+                if (s.cfg.io_float) {
+                    io_note = "; I/O threads (PLE, direct reads) on every CPU but the host's (STRATA_AUX_IO=float)";
+                } else {
+                    io_note = "; I/O threads (PLE, direct reads) on CPUs ";
+                    for (size_t i = 0; i < s.io_plan.size(); ++i) io_note += (i ? "," : "") + std::to_string(s.io_plan[i]);
+                    io_note += " (STRATA_AUX_IO)";
+                }
+                detail::purge_locked(s);
+                for (int tid : s.io_tids) (void) sched_setaffinity(tid, sizeof s.io_target, &s.io_target);
+            } else {
+                io_note = "; STRATA_AUX_IO: no usable CPU, off";
+                for (int tid : s.io_tids) s.owned.erase(tid);   // back to the ordinary rules
+                s.io_tids.clear();
+            }
+        }
     }
     if (plan.empty()) note = "none spare (every CPU is the host's, a worker's or shares a core with a worker or has no known core)";
     if (s.cfg.on && !plan.empty()) set_enabled(true);
@@ -338,11 +436,15 @@ inline std::string set_topology(int host_cpu, const std::vector<int>& worker_cpu
     }
     return "strata aux cpus: threads that are neither pool workers nor the host go to CPUs " + note +
            (!s.cfg.on ? " (off at start; a request's aux_cpus=1 turns it on)"
-            : plan.empty() ? " (nothing to do)" : " (on; " + std::to_string(moved) + " threads placed so far)");
+            : plan.empty() ? " (nothing to do)" : " (on; " + std::to_string(moved) + " threads placed so far)") + io_note;
 }
 
 #else  // not Linux: the same names, doing nothing
 
+inline bool configure(const std::string& spec, const std::string& io_spec, std::string& err) {
+    Config cfg;
+    return parse_spec(spec, cfg, err) && parse_io_spec(io_spec, cfg, err);
+}
 inline bool configure(const std::string& spec, std::string& err) {
     Config cfg;
     return parse_spec(spec, cfg, err);
@@ -350,6 +452,7 @@ inline bool configure(const std::string& spec, std::string& err) {
 inline void note_owned_thread() {}
 inline int sweep() { return 0; }
 inline void pin_current_thread() {}
+inline void pin_current_io_thread() {}
 inline int restore() { return 0; }
 inline void set_enabled(bool) {}
 inline bool enabled() { return false; }

@@ -1923,7 +1923,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
         if (ple_on && !ple_next.valid())
             ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
-                strata::aux_cpus::pin_current_thread();
+                strata::aux_cpus::pin_current_io_thread();
                 return ple_gather(c0, b, ple_next_err);
             });
         bool ple_pending = ple_on;
@@ -1949,7 +1949,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 }
                 ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
-                    strata::aux_cpus::pin_current_thread();
+                    strata::aux_cpus::pin_current_io_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
             }

@@ -2022,7 +2022,7 @@ int main(int argc, char** argv) {
             if (const char* e = std::getenv("STRATA_AUX_CPUS")) ac = e;
         std::string aerr;
         if (!strata::aux_cpus::configure(ac, aerr)) {
-            std::fprintf(stderr, "strata generate: STRATA_AUX_CPUS: %s\n", aerr.c_str());
+            std::fprintf(stderr, "strata generate: %s\n", aerr.c_str());
             return 2;
         }
     }

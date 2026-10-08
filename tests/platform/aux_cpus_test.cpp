@@ -135,7 +135,7 @@ void test_live() {
     }
     const int host = allowed[0], worker = allowed[1], aux_a = allowed[2], aux_b = allowed[3];
     std::string err;
-    CHECK(configure(std::to_string(aux_a) + "," + std::to_string(aux_b), err));
+    CHECK(configure(std::to_string(aux_a) + "," + std::to_string(aux_b), "", err));
     // before the plan exists nothing is moved
     CHECK(sweep() == 0);
     const std::string line = set_topology(host, V{worker});
@@ -198,7 +198,140 @@ void test_live() {
     late.join();
     pinned.join();
 }
+
+// STRATA_AUX_IO: the I/O threads (pin_current_io_thread) next to the ordinary helpers (pin_current_thread)
+struct Live {
+    std::atomic<int> tid{0};
+    std::thread th;
+};
+
+void test_io() {
+    const std::vector<int> allowed = mask_of(0);
+    if (allowed.size() < 4) {
+        std::printf("aux_cpus_test: STRATA_AUX_IO skipped (needs 4 allowed CPUs, have %zu)\n", allowed.size());
+        return;
+    }
+    const int host = allowed[0], worker = allowed[1], aux_a = allowed[2], aux_b = allowed[3];
+    const std::string aux_spec = std::to_string(aux_a) + "," + std::to_string(aux_b);
+    const V aux{aux_a, aux_b};
+    V allowed_minus_host(allowed.begin() + 1, allowed.end());
+    std::atomic<bool> stop{false};
+    auto spawn = [&](Live& l, bool io) {
+        l.tid = 0;
+        l.th = std::thread([&l, io, &stop] {
+            if (io) pin_current_io_thread();
+            else pin_current_thread();
+            l.tid = tid_of_self();
+            while (!stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        });
+        for (int i = 0; i < 500 && !l.tid; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    };
+    std::string err;
+
+    // unset: an I/O thread is a helper (before and after set_topology), as today
+    {
+        Live pre, post;
+        CHECK(configure(aux_spec, "", err));
+        spawn(pre, true);                                  // before the plan: unmoved
+        CHECK(mask_of(pre.tid) == allowed);
+        std::printf("%s\n", set_topology(host, V{worker}).c_str());
+        CHECK(mask_of(pre.tid) == aux);                    // swept like any helper
+        spawn(post, true);
+        CHECK(mask_of(post.tid) == aux);                   // pinned at creation like pin_current_thread()
+        set_enabled(false);
+        CHECK(mask_of(pre.tid) == allowed);
+        CHECK(mask_of(post.tid) == allowed);
+        set_enabled(true);
+        CHECK(mask_of(post.tid) == aux);
+        set_enabled(false);
+        stop = true;
+        pre.th.join();
+        post.th.join();
+        stop = false;
+    }
+
+    // float: allowed minus the host's CPU, whatever the aux plan says, through sweep / restore / re-enable
+    {
+        Live pre, post, helper;
+        CHECK(configure(aux_spec, "float", err));
+        spawn(pre, true);
+        CHECK(mask_of(pre.tid) == allowed);                // the host's CPU is not known before set_topology
+        const std::string line = set_topology(host, V{worker});
+        std::printf("%s\n", line.c_str());
+        CHECK(line.find("STRATA_AUX_IO=float") != std::string::npos);
+        CHECK(mask_of(pre.tid) == allowed_minus_host);
+        spawn(post, true);
+        CHECK(mask_of(post.tid) == allowed_minus_host);
+        spawn(helper, false);
+        CHECK(mask_of(helper.tid) == aux);                 // an ordinary helper still goes to the plan
+        (void) sweep();
+        CHECK(mask_of(pre.tid) == allowed_minus_host);
+        CHECK(mask_of(post.tid) == allowed_minus_host);
+        set_enabled(false);
+        CHECK(mask_of(pre.tid) == allowed_minus_host);
+        CHECK(mask_of(post.tid) == allowed_minus_host);
+        CHECK(mask_of(helper.tid) == allowed);
+        set_enabled(true);
+        CHECK(mask_of(pre.tid) == allowed_minus_host);
+        CHECK(mask_of(post.tid) == allowed_minus_host);
+        CHECK(mask_of(helper.tid) == aux);
+        set_enabled(false);
+        stop = true;
+        pre.th.join();
+        post.th.join();
+        helper.th.join();
+        stop = false;
+    }
+
+    // a list: the list minus the host's CPU (the worker's CPU is allowed on purpose)
+    {
+        Live pre, post;
+        const std::string list = std::to_string(worker) + "," + std::to_string(aux_b) + "," + std::to_string(host);
+        CHECK(configure(aux_spec, list, err));
+        spawn(pre, true);
+        const std::string line = set_topology(host, V{worker});
+        std::printf("%s\n", line.c_str());
+        const V want{worker, aux_b};
+        CHECK(mask_of(pre.tid) == want);
+        spawn(post, true);
+        CHECK(mask_of(post.tid) == want);
+        (void) sweep();
+        set_enabled(false);
+        set_enabled(true);
+        CHECK(mask_of(pre.tid) == want);
+        CHECK(mask_of(post.tid) == want);
+        set_enabled(false);
+        stop = true;
+        pre.th.join();
+        post.th.join();
+        stop = false;
+    }
+
+    // a list that becomes empty (only the host's CPU) turns the class off: the threads are helpers again
+    {
+        Live pre, post;
+        CHECK(configure(aux_spec, std::to_string(host), err));
+        spawn(pre, true);
+        const std::string line = set_topology(host, V{worker});
+        std::printf("%s\n", line.c_str());
+        CHECK(line.find("no usable CPU") != std::string::npos);
+        CHECK(mask_of(pre.tid) == aux);
+        spawn(post, true);
+        CHECK(mask_of(post.tid) == aux);
+        set_enabled(false);
+        stop = true;
+        pre.th.join();
+        post.th.join();
+        stop = false;
+    }
+
+    // bad specs
+    CHECK(!configure("", "26,x", err));
+    CHECK(configure("", "off", err));
+    CHECK(configure("", "", err));
+}
 #else
+void test_io() { std::printf("aux_cpus_test: STRATA_AUX_IO placement is Linux only\n"); }
 void test_live() { std::printf("aux_cpus_test: live placement is Linux only\n"); }
 #endif
 
@@ -208,6 +341,7 @@ int main() {
     test_parse();
     test_derive();
     test_live();
+    test_io();
     if (failures) {
         std::fprintf(stderr, "aux_cpus_test: %d check(s) failed\n", failures);
         return 1;
