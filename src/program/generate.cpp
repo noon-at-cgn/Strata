@@ -8555,6 +8555,7 @@ int main(int argc, char** argv) {
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0, bt_host0 = 0, bt_cwait0 = 0;   // bt_host0: stage 0's host staging; bt_cwait0: the commit waits (all stages)
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
+        int64_t bt_ple_g0 = 0, bt_ple_t0 = 0;   // stage 0's PLE gathers / ticket-path gathers when the timed windows began
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
@@ -8856,6 +8857,8 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k <= stages.size(); ++k) bt_door0.push_back(stage_verifier((int) k).door_lat);
                 if (drive.d.recall != nullptr) recall.reset();   // a burst's windows only
                 bt_host0 = stage_verifier(0).ms_host;
+                bt_ple_g0 = stage_verifier(0).ple_gathers;
+                bt_ple_t0 = stage_verifier(0).ple_ticket_gathers;
                 bt_cwait0 = 0;
                 for (size_t k = 0; k <= stages.size(); ++k) bt_cwait0 += stage_verifier((int) k).ms_commit_wait;
                 bt_cpu_ent0 = drive.d.multi_entries; bt_off_ent0 = drive.d.offload_entries;
@@ -9033,7 +9036,8 @@ int main(int argc, char** argv) {
                                      "(ms/window): %s; per layer-window: CPU experts %.2f, VRAM hits %.2f, PCIe %.2f; routed "
                                      "entries per window: VRAM %.1f (%.1f%%), PCIe %.1f (%.1f%%), CPU %.1f (%.1f%%)%s; %.1f rows/s "
                                      "over %.0f ms of wall time (admissions included); commit wait %.2f ms/window "
-                                     "(STRATA_SPLIT_COMMIT_ASYNC); stage 0 host staging %.2f ms/window\n",
+                                     "(STRATA_SPLIT_COMMIT_ASYNC); stage 0 host staging %.2f ms/window; PLE gather ticket %lld/%lld "
+                                     "(STRATA_BATCH_PLE_LATE)\n",
                              (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit + bt_adapt_wait) / w, bt_run / w,
                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                              bt_adapt_wait / w, per_stage.c_str(),
@@ -9041,7 +9045,9 @@ int main(int argc, char** argv) {
                              (drive.d.pcie_experts - bt_pcie0) / (w * L), e_vram / w, 100.0 * e_vram / e_all, e_pcie / w,
                              100.0 * e_pcie / e_all, e_cpu / w, 100.0 * e_cpu / e_all, extra_txt.c_str(),
                              1000.0 * bt_rows / std::max(wall, 1e-9), wall, commit_wait_ms / w,
-                             (stage_verifier(0).ms_host - bt_host0) / w);
+                             (stage_verifier(0).ms_host - bt_host0) / w,
+                             (long long) (stage_verifier(0).ple_ticket_gathers - bt_ple_t0),
+                             (long long) (stage_verifier(0).ple_gathers - bt_ple_g0));
                 for (size_t k = 0; k <= stages.size(); ++k) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());

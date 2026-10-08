@@ -2647,7 +2647,10 @@ bool Verifier::gather_pending_ple(std::string& err) {
     const Clock::time_point tp = Clock::now();
     const size_t n = pend_ple_n_;
     pend_ple_n_ = 0;
+    const uint64_t tk0 = ss_->ple.table->ticket_gathers();
     if (!ss_->ple.table->gather_batch(pend_ple_rows_.data(), n, h_ple_, err)) return false;
+    ++ple_gathers;
+    ple_ticket_gathers += ss_->ple.table->ticket_gathers() != tk0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     ms_host += ms_since(tp);
@@ -2715,8 +2718,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             // second read); the caller gathers them after the graph launch, before it raises layer 0's flag
             for (int t = 0; t < S; ++t) ss_->ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
             pend_ple_n_ = (size_t) S;
-        } else if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) {
-            return false;
+        } else {
+            const uint64_t tk0 = ss_->ple.table->ticket_gathers();
+            if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+            ++ple_gathers;
+            ple_ticket_gathers += ss_->ple.table->ticket_gathers() != tk0;
         }
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative

@@ -293,6 +293,7 @@ public:
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     double ms_commit_wait = 0;   ///< batch windows, STRATA_SPLIT_COMMIT_ASYNC: host time in the waits for the previous window's commit
+    int64_t ple_gathers = 0, ple_ticket_gathers = 0;   ///< batch windows: PLE gather_batch calls, and those the prefetch tickets answered
     int64_t windows = 0;
     /// STRATA_SPLIT_TIMING: how long the host took from seeing each layer's doorbell to raising flag A, over every layer
     /// served since the start (a request's numbers: `door_lat.since(copy taken at its start)`)
