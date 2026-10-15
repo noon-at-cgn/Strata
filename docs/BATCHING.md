@@ -184,7 +184,9 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   checkpoint at the prompt's last turn boundary); the next turn of that conversation goes to that slot and the
   engine copies its state back (50-60 ms for a short conversation) instead of reading the history again - also for
   a client that drops the reply's thinking from the history (the checkpoint matches up to the new turn). A new
-  conversation takes an empty slot, else the one used longest ago.
+  conversation takes an empty slot, else the one used longest ago; a request whose prompt shares at least three
+  quarters of a slot's held tokens (a changed last question, which the turn-checkpoint rule above does not cover) counts as that
+  conversation's next turn even though the held tokens are no longer a prefix, so it never takes another lane's slot.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 

@@ -363,6 +363,21 @@ class ClientGone(Exception):
     waiting for its turn): nothing is left to answer."""
 
 
+def common_prefix_len(a: list[int], b: list[int]) -> int:
+    """How many leading tokens the two lists share (slice compares run in C: a 250k-token list takes ~20 of them)."""
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n               # a[:lo] == b[:lo], a[:hi] != b[:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[:mid] == b[:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
@@ -2060,6 +2075,7 @@ class StrataEngine:
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
+    SLOT_REWRITE_MIN = 1024  # a held conversation whose tail was rewritten counts as this prompt's own from this many shared tokens
 
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
@@ -2092,7 +2108,14 @@ class StrataEngine:
             if len(h) < len(prompt) and prompt[:len(h)] == h:
                 return len(h)
             k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
-            return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
+            if 0 < k < len(prompt) and prompt[:k] == h[:k]:
+                return k
+            # a client that changed its last question no longer agrees with the held tokens up to the slot's last turn
+            # start either - but the slot is still THIS conversation's (the engine resumes from one of its periodic
+            # checkpoints), so a second conversation must not take it: at least three quarters of what it holds
+            # is shared (a long system prompt in common is not enough)
+            shared = min(common_prefix_len(h, prompt), len(prompt) - 1)
+            return shared if shared >= self.SLOT_REWRITE_MIN and shared * 4 >= len(h) * 3 else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
